@@ -44,9 +44,9 @@ For any unobserved discrete variables that don't benefit from conjugacy, but hav
 
 For any unobserved continuous variables that don't benefit from conjugacy or aren't exponential family, apply a stochastic update based on an estimate of the gradient -- either:
 
-* Use the reparameterisation trick from the Black Box Variational Inference paper [4] and the Auto-encoding VB paper [8], or
-* The variance-reduced estimator from [7] (although this requires training a neural net to generate a variance reduction term), or [9] (although I think this requires proposing a model-specific control variate / might be hard to automate)
-* The Local Expectation Gradients approach from [6], which also works for discrete variables. This is shown to be lower-variance than [4] although requires more function evaluations for Gaussian quadrature, or
+* Use the reparameterisation trick from [8] [10] [11], which allows the model log-likelihood gradient to be used, or
+* The gradient estimator from Black box variational inference [3] -- either the Rao-Blackwellized one or the control variate one. Or perhaps a more sophisticated control variate, e.g. from [7] -- although this requires training a neural net to generate a variance reduction term -- or [9] -- although I think this requires proposing a model-specific control variate / might be hard to automate.
+* The Local Expectation Gradients approach from [6], which also works for discrete variables. This is shown to be lower-variance than [3] although requires more function evaluations for Gaussian quadrature, or
 * Should probably pick just one of these -- whichever is most general without being too slow -- maybe [6] ?
 
 ### Discrete numeric nodes with infinite (or large) support
@@ -54,7 +54,7 @@ For any unobserved continuous variables that don't benefit from conjugacy or are
 For any unobserved discrete variables with infinite support (Poisson, Negative binomial, Geometric...):
 
 * Re-parameterisation trick won't work
-* [7] or [9] could work but with the downsides mentioned
+* [3] or [7], [9] could work but with the downsides mentioned
 * [6] would require us to approximate the infinite sum by some discrete equivalent of Gaussian quadrature. Doable but details might be a bit fiddly, still potentially preferable
 * These kind of variables don't tend to occur that much as latents anyway, so could omit support initially
 
@@ -77,7 +77,7 @@ Where there's an IID sub-model for each data point which includes some unmargina
 
 ## Deterministic nodes
 
-Arbitrary differentiable deterministic functions of continuous variables should be allowable. They'll break conjugacy (or at least our ability to discover it automatically) so BBVI-style updates will be required. If deterministic functions of continuous variables are observed, we'd need the function to be invertible and its inverse function available, and its Jacobean too if you want the log-probability of the transformed data.
+Arbitrary differentiable deterministic functions of continuous variables should be allowable. They'll break conjugacy (or at least our ability to discover it automatically) so one of the options for non-conjugate updates will be required, with those that can take advantage of the model gradient particularly attractive here. If deterministic functions of continuous variables are observed, we'd need the function to be invertible and its inverse function available, and its Jacobean too if you want the log-probability of the transformed data.
 
 I think we could allow arbitrary deterministic functions of discrete latents too, thinking about them in terms of the pick/discrete choice functions described in [1] which can preserve conjugacy when they choose between conjugate parents (e.g. choosing between Dirichlet topic distributions for words in LDA). When discrete variables are marginalised or approximated by full discrete factors, I think we could manage deterministic functions of them too, although we might need the inverse of the deterministic implemented too, and it might be quite easy to write something that blows up.
 
@@ -87,20 +87,24 @@ Linear transformations of Gaussians are another kind of deterministic that it mi
 
 Sorry I'm crap at citing things properly in Markdown:
 
-[1] VIBES: http://papers.nips.cc/paper/2172-vibes-a-variational-inference-engine-for-bayesian-networks.pdf
+[1] Bishop, Christopher M., David Spiegelhalter, and John Winn. “VIBES: A Variational Inference Engine for Bayesian Networks.” In Advances in Neural Information Processing Systems, 777–84, 2002. http://machinelearning.wustl.edu/mlpapers/paper_files/AA37.pdf.
 
-[2] Infer.NET: http://research.microsoft.com/en-us/um/cambridge/projects/infernet/
+[2] Minka, T., J.M. Winn, J.P. Guiver, S. Webster, Y. Zaykov, B. Yangel, A. Spengler, and J. Bronskill. Infer.NET 2.6, 2014. http://research.microsoft.com/en-us/um/cambridge/projects/infernet/
 
-[3] Black box variational inference: http://www.cs.columbia.edu/~blei/papers/RanganathGerrishBlei2014.pdf
+[3] Ranganath, Rajesh, Sean Gerrish, and David M. Blei. “Black Box Variational Inference.” arXiv:1401.0118 [cs, Stat], December 31, 2013. http://arxiv.org/abs/1401.0118.
 
-[4] Stochastic Variational Inference: http://www.columbia.edu/~jwp2128/Papers/HoffmanBleiWangPaisley2013.pdf
+[4] Hoffman, Matt, David M. Blei, Chong Wang, and John Paisley. “Stochastic Variational Inference.” arXiv:1206.7051 [cs, Stat], June 29, 2012. http://arxiv.org/abs/1206.7051.
 
-[5] Fast variational inference in the conjugate exponential family: http://papers.nips.cc/paper/4766-fast-variational-inference-in-the-conjugate-exponential-family.pdf
+[5] Hensman, James, Magnus Rattray, and Neil D. Lawrence. “Fast Variational Inference in the Conjugate Exponential Family.” In Advances in Neural Information Processing Systems, 2888–96, 2012. http://papers.nips.cc/paper/4766-fast-variational-inference-in-the-conjugate-exponential-family.
 
-[6] Local Expectation Gradients for Doubly Stochastic Variational Inference http://arxiv.org/abs/1503.01494
+[6] Titsias, Michalis K. “Local Expectation Gradients for Doubly Stochastic Variational Inference.” arXiv:1503.01494 [stat], March 4, 2015. http://arxiv.org/abs/1503.01494.
 
-[7] Neural Variational Inference and Learning in Belief Networks http://arxiv.org/pdf/1402.0030v2.pfd
+[7] Mnih, Andriy, and Karol Gregor. “Neural Variational Inference and Learning in Belief Networks.” arXiv:1402.0030 [cs, Stat], January 31, 2014. http://arxiv.org/abs/1402.0030.
 
-[8] Auto-Encoding Variational Bayes http://arxiv.org/pdf/1312.6114v10.pdf
+[8] Kingma, Diederik P., and Max Welling. “Auto-Encoding Variational Bayes.” arXiv:1312.6114 [cs, Stat], December 20, 2013. http://arxiv.org/abs/1312.6114.
 
-[9] Variational Bayesian Inference with Stochastic Search http://www.cs.columbia.edu/~blei/papers/PaisleyBleiJordan2012a.pdf
+[9] Paisley, John, David Blei, and Michael Jordan. “Variational Bayesian Inference with Stochastic Search.” arXiv:1206.6430 [cs, Stat], June 27, 2012. http://arxiv.org/abs/1206.6430.
+
+[10] Rezende, Danilo Jimenez, Shakir Mohamed, and Daan Wierstra. “Stochastic Backpropagation and Approximate Inference in Deep Generative Models.” arXiv:1401.4082 [cs, Stat], January 16, 2014. http://arxiv.org/abs/1401.4082.
+
+[11] Kucukelbir, Alp, Rajesh Ranganath, Andrew Gelman, and David M. Blei. “Automatic Variational Inference in Stan.” arXiv:1506.03431 [stat], June 10, 2015. http://arxiv.org/abs/1506.03431.
