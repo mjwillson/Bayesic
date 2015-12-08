@@ -44,7 +44,7 @@ For any unobserved discrete variables that don't benefit from conjugacy, but hav
 
 For any unobserved continuous variables that don't benefit from conjugacy or aren't exponential family, apply a stochastic update based on an estimate of the gradient -- either:
 
-* Use the reparameterisation trick from [8] [10] [11], which allows the model log-likelihood gradient to be used, or
+* Use the reparameterisation trick from [10] [11] [12], which allows the model log-likelihood gradient to be used, or
 * The gradient estimator from Black box variational inference [3] -- either the Rao-Blackwellized one or the control variate one. Or perhaps a more sophisticated control variate, e.g. from [7] -- although this requires training a neural net to generate a variance reduction term -- or [9] -- although I think this requires proposing a model-specific control variate / might be hard to automate.
 * The Local Expectation Gradients approach from [6], which also works for discrete variables. This is shown to be lower-variance than [3] although requires more function evaluations for Gaussian quadrature, or
 * Should probably pick just one of these -- whichever is most general without being too slow -- maybe [6] ?
@@ -85,8 +85,6 @@ Linear transformations of Gaussians are another kind of deterministic that it mi
 
 ## Papers
 
-Sorry I'm crap at citing things properly in Markdown:
-
 [1] Bishop, Christopher M., David Spiegelhalter, and John Winn. “VIBES: A Variational Inference Engine for Bayesian Networks.” In Advances in Neural Information Processing Systems, 777–84, 2002. http://machinelearning.wustl.edu/mlpapers/paper_files/AA37.pdf.
 
 [2] Minka, T., J.M. Winn, J.P. Guiver, S. Webster, Y. Zaykov, B. Yangel, A. Spengler, and J. Bronskill. Infer.NET 2.6, 2014. http://research.microsoft.com/en-us/um/cambridge/projects/infernet/
@@ -108,3 +106,6 @@ Sorry I'm crap at citing things properly in Markdown:
 [10] Rezende, Danilo Jimenez, Shakir Mohamed, and Daan Wierstra. “Stochastic Backpropagation and Approximate Inference in Deep Generative Models.” arXiv:1401.4082 [cs, Stat], January 16, 2014. http://arxiv.org/abs/1401.4082.
 
 [11] Kucukelbir, Alp, Rajesh Ranganath, Andrew Gelman, and David M. Blei. “Automatic Variational Inference in Stan.” arXiv:1506.03431 [stat], June 10, 2015. http://arxiv.org/abs/1506.03431.
+
+[12] Kingma, Diederik P., and Max Welling. “Efficient Gradient-Based Inference through Transformations between Bayes Nets and Neural Nets.” arXiv:1402.0480 [cs, Stat], February 3, 2014. http://arxiv.org/abs/1402.0480.
+
