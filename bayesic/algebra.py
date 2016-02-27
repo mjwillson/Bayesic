@@ -4,32 +4,53 @@ sadly we need smarter algebra than theano, and better symbolic tensor
 support than sympy.
 
 """
+import theano
 import theano.tensor as T
 from collections import Counter
 
 class Expression(object):
+    def __init__(self, parents):
+        self.parents = parents
+
     @property
     def input_types(self):
         """Dict of name to (dtype, ndim)"""
-        raise NotImplementedError
+        result = {}
+        for expr in self.parents:
+            for name, type_ in expr.input_types.items():
+                if result.get(name, type_) != type_:
+                    raise TypeError("same input %s occurs with different types %s, %s" % (type_, result[name]))
+                result[name] = type_
+        return result
 
     # also must have properties ndim, dtype
 
-    def apply_to_inputs_dict(self, inputs):
-        """Like apply, but will accept a dict with other inputs besides ours
-        in it and pick out only the relevant ones.
-
-        """
-        input_types = self.input_types()
-        our_inputs = {name: var for name, var in inputs.items() if name in input_types}
-        return self.apply(**our_inputs)
-
-    def apply(self, **inputs):
+    def apply(self, inputs):
         """Given theano variables for the inputs, return a theano variable for
         the output.
 
         """
+        parent_vars = [parent.apply(inputs) for parent in self.parents]
+        return self._apply_to_parents(*parent_vars)
+
+    def compile(self):
+        input_vars = {
+            name: T.TensorType(dtype, [False]*ndim)(name)
+            for name, (dtype, ndim) in self.input_types.items()
+        }
+        expression = self.apply(input_vars)
+        inputs = list(input_vars.values())
+        input_names = list(input_vars.keys())
+        fn = theano.function(inputs, expression)
+        def f(**inputs):
+            return fn(*(inputs[name] for name in input_names))
+        return f
+
+    def _apply_to_parents(self, *parent_vars):
         raise NotImplementedError
+
+    def __repr__(self):
+        return "%s(%s)" % (type(self).__name__, ', '.join(repr(x) for x in self.parents))
 
     def terms(self):
         """self must be equivalent to Sum(self.terms)"""
@@ -41,48 +62,22 @@ class InputExpression(Expression):
         self.name = name
         self.ndim = ndim
         self.dtype = dtype
+        super(InputExpression, self).__init__([])
 
     @property
     def input_types(self):
         return {self.name: (self.dtype, self.ndim)}
 
-    def apply(self, **inputs):
+    def apply(self, inputs):
         return inputs[self.name]
 
-    def __str__(self):
+    def __repr__(self):
         return self.name
 
 
-class CompositeExpression(Expression):
-    """An expression given in terms of some other parent expressions"""
 
-    def __init__(self, parents):
-        self.parents = parents
-
-    @property
-    def input_types(self):
-        result = {}
-        for expr in self.parents:
-            for name, type_ in expr.input_types().items():
-                if result.get(name, type_) != type_:
-                    raise TypeError("same input %s occurs with different types %s, %s" % (type_, result[name]))
-                result[name] = type
-        return result
-
-    def apply(self, **inputs):
-        parent_vars = [parent.apply_to_inputs_dict(inputs) for parent in self.parents]
-        return self._apply_to_parents(*parent_vars)
-
-    def _apply_to_parents(self, *parent_vars):
-        raise NotImplementedError
-
-    def __str__(self):
-        return "%s(%s)" % (type(self).__name__, ', '.join(self.parents))
-
-
-
-class Add(CompositeExpression):
-    def __init__(self, terms):
+class Add(Expression):
+    def __init__(self, *terms):
         # associativity means we can avoid sums within sums
         flattened_terms = [t for term in terms for t in term.terms()]
 
@@ -113,7 +108,7 @@ def find_duplicate(values):
         seen[v] = i
 
 
-class Einsum(CompositeExpression):
+class Einsum(Expression):
     """This is a general form for various kinds of products between
     tensors, and other multilinear functions of tensors, similar to
     numpy.einsum.
@@ -127,46 +122,39 @@ class Einsum(CompositeExpression):
     f(X, Y, Z)_{a,b,c} = sum_{i,j} X_{a,i} Y_{i,j,b} Z_{c, j}
     """
 
-    def __init__(self, factors, indices_for_factors):
-        """`factors` -- one or more arguments
+    def __init__(self, *factors_and_indices):
+        """`factors_and_indices` -- pairs of (factor, indices)
+        where indices contains an index for each axis of the factor.
 
-        `sum_indices` -- a list of lists of indices, where each index
-        is a pair `(factor_number, axis)` representing a particular
-        axis of one of the factors. Each list corresponds to a
-        summation where all the specified axes are indexed by the
-        summation index.
+        Indices are either ('sum', n) or ('out', n).
 
-        `output_indices` -- a list of list of indices, like the above.
-        The nth list of indices determines the axis which are indexed
-        by the nth output index.
+        A sum index will be summed over; an out index matches an axis
+        of the output tensor.
 
-        Each axis of each factor must occur once and only once in the
-        above lists.
         """
-        self.factors = factors
-        self.indices_for_factors = indices_for_factors
-        if not all(f.ndim == len(indices) for f, indices in zip(factors, indices_for_factors)):
+        self.factors_and_indices = factors_and_indices
+        if not all(f.ndim == len(indices) for f, indices in factors_and_indices):
             raise ValueError("The indices for each factor must have same length as factor.ndim")
 
         output_nums = set(
-            num for indices in indices_for_factors
+            num for factors, indices in factors_and_indices
             for type_, num in indices
-            if type_ == 'output'
+            if type_ == 'out'
         )
-        self.sum_nums = sorted(
-            num for _, indices in vars_and_indices
+        self.sum_nums = sorted(set(
+            num for factors, indices in factors_and_indices
             for type_, num in indices
             if type_ == 'sum'
-        )
+        ))
 
         if not all(num in output_nums for num in range(len(output_nums))):
             raise ValueError("some output index numbers are missing")
         self.ndim = len(output_nums)
-        self.dtype = factors[0].dtype
-        if not all(t.dtype == self.dtype for t in flattened_terms):
-            raise ValueError("Add requires same ndim, dtype on all terms")
+        self.dtype = factors_and_indices[0][0].dtype
+        if not all(f.dtype == self.dtype for f, _ in factors_and_indices):
+            raise ValueError("Add requires same dtype on all factors")
 
-        super(Einsum, self).__init__(factors)
+        super(Einsum, self).__init__([f for f, _ in factors_and_indices])
 
     @property
     def output_type(self):
@@ -175,7 +163,7 @@ class Einsum(CompositeExpression):
     def factors(self):
         return self.parents
 
-    def _eliminate_duplicate_indices(var, indices):
+    def _eliminate_duplicate_indices(self, var, indices):
         while True:
             dupe_info = find_duplicate(indices)
             if dupe_info is None:
@@ -188,29 +176,29 @@ class Einsum(CompositeExpression):
     def _apply_to_parents(self, *factor_vars):
         vars_and_indices = [
             self._eliminate_duplicate_indices(var, indices)
-            for var, indices in zip(factor_vars, self.indices_for_factors)
+            for var, (factor, indices) in zip(factor_vars, self.factors_and_indices)
         ]
 
-        def axis_of(index, indices, fallback):
+        def axis_of(index, indices):
             try:
                 return indices.index(index)
-            except IndexError:
+            except ValueError:
                 return 'x'
 
         def shuffle_to_axes(factor_indices):
-            return [axis_of(('output', num), factor_indices) for num in range(self.ndim)] + \
-                [axis_of(('sum', num), factor_indices) for num in sum_nums]
+            return [axis_of(('out', num), factor_indices) for num in range(self.ndim)] + \
+                [axis_of(('sum', num), factor_indices) for num in self.sum_nums]
 
         aligned_vars = [
             var.dimshuffle(*shuffle_to_axes(factor_indices))
             for var, factor_indices in vars_and_indices
         ]
-        sum_axes_in_output = list(range(len(output_nums), len(output_nums) + len(sum_nums)))
+        sum_axes_in_output = list(range(self.ndim, self.ndim + len(self.sum_nums)))
         return T.mul(*aligned_vars).sum(axis=sum_axes_in_output)
 
-    def __str__(self):
+    def __repr__(self):
         def letter_for_index(type, num):
-            if type == 'output':
+            if type == 'out':
                 try:
                     return 'uvwxyz'[num]
                 except IndexError:
@@ -222,9 +210,67 @@ class Einsum(CompositeExpression):
                     return 's%d' % num
 
         product = ' '.join(
-            "%s_%s" % (factor, ''.join(letter_for_index(*i) for i in indices))
-            for factor, indices in self.indices_for_factors
+            "%r_%s" % (factor, ''.join(letter_for_index(*i) for i in indices))
+            for factor, indices in self.factors_and_indices
         )
         sum_letters = ''.join(letter_for_index('sum', n) for n in self.sum_nums)
-        output_letters = ''.join(letter_for_index('output', i) for n in range(self.ndim))
-        return 'Einsum(output_%s = sum_%s %s)' % (output_letters, sum_letters, product)
+        output_letters = ''.join(letter_for_index('out', n) for n in range(self.ndim))
+        return 'Einsum(out_%s = sum_%s %s)' % (output_letters, sum_letters, product)
+
+
+def dot(X, Y):
+    """Inner / dot product of two tensors. Sums over the last axis of X
+    and the first of Y."""
+    X_indices = [('out', i) for i in range(X.ndim-1)] + [('sum', 0)]
+    Y_indices = [('sum', 0)] + [('out', i) for i in range(X.ndim - 1, X.ndim + Y.ndim - 2)]
+    return Einsum((X, X_indices), (Y, Y_indices))
+
+def prod(*args):
+    """Element-wise / hadamard product of some tensors."""
+    # TODO check ndims all the same
+    args_and_indices = [
+        (arg, [('out', i) for i in range(arg.ndim)])
+        for arg in args
+    ]
+    return Einsum(*args_and_indices)
+
+def outer(X, Y):
+    """Outer product of two tensors, a.k.a. tensor product.
+    Unlike theano's this generalises to all tensor shapes.
+
+    Kronecker product is a reshaped version of this applied to matrix
+    args.
+
+    """
+    X_indices = [('out', i) for i in range(X.ndim)]
+    Y_indices = [('out', i) for i in range(X.ndim, X.ndim + Y.ndim)]
+    return Einsum((X, X_indices), (Y, Y_indices))
+
+def sum(X, axis=None):
+    """Sum entries along all axes, or the given axis (or axes) only if specified"""
+    if isinstance(axis, int): axis = [axis]
+    if axis is None: axis = range(X.ndim)
+    indices = []
+    sum_index = 0
+    out_index = 0
+    for i in range(X.ndim):
+        if i in axis:
+            indices.append(('sum', sum_index))
+            sum_index += 1
+        else:
+            indices.append(('out', out_index))
+            out_index += 1
+    return Einsum((X, indices))
+
+def trace(X):
+    # TODO could specify axes
+    return Einsum((X, [('sum', 0), ('sum', 0)]))
+
+def diagonal(X):
+    # TODO could specify axes
+    return Einsum((X, [('out', 0), ('out', 0)]))
+
+def transpose(X):
+    return Einsum((X, [('out', i) for i in reversed(range(X.ndim))]))
+
+# TODO: tensor_dot, batched_dot, dimshuffle,
