@@ -1,27 +1,90 @@
 from ..algebra import *
 
 import numpy.testing as npt
+import numpy as np
+import numpy.random as npr
 
+npr.seed(1234)
 
+# Create some inputs, symbolic ones together with concrete numpy
+# arrays:
+def randn(*shape):
+    return npr.randn(*shape).astype('float32')
+
+# Some square matrices
+X = InputExpression('X', 2)
+Y = InputExpression('Y', 2)
+X_ = randn(5, 5)
+Y_ = randn(5, 5)
+
+# Some vectors
+x = InputExpression('x', 1)
+y = InputExpression('y', 1)
+x_ = randn(5)
+y_ = randn(5)
+
+# 3D tensor
+T = InputExpression('T', 3)
+T_ = randn(3, 5, 7)
 
 
 def test_add():
-    X = InputExpression('X', 2)
-    Y = InputExpression('Y', 2)
-    out = Add(X, Y)
-    fn = out.compile()
-    npt.assert_equal(
-        fn(X=[[1,2],[3,4]], Y=[[4,3],[2,1]]),
-        [[5,5],[5,5]]
-    )
+    fn = add(X, Y).compile()
+    npt.assert_allclose(fn(X=X_, Y=Y_), X_ + Y_)
 
 
-def test_mx_mx_product():
-    X = InputExpression('X', 2)
-    Y = InputExpression('Y', 2)
-    XY = dot(X, Y)
-    fn = XY.compile()
-    npt.assert_equal(
-        fn(X=[[1,2],[3,4]], Y=[[4,3],[2,1]]),
-        [[8,5],[20,13]]
-    )
+def test_dot_matrix_matrix():
+    fn = dot(X, Y).compile()
+    npt.assert_allclose(fn(X=X_, Y=Y_), np.dot(X_, Y_), rtol=1e-5)
+
+
+def test_dot_matrix_vector():
+    fn = dot(X, y).compile()
+    npt.assert_allclose(fn(X=X_, y=y_), np.dot(X_, y_), rtol=1e-5)
+
+
+def test_dot_vector_vector():
+    fn = dot(x, y).compile()
+    npt.assert_allclose(fn(x=x_, y=y_), np.dot(x_, y_), rtol=1e-5)
+
+
+def test_mul():
+    fn = mul(X, Y).compile()
+    npt.assert_allclose(fn(X=X_, Y=Y_), np.multiply(X_, Y_), rtol=1e-5)
+
+def test_transpose():
+    fn = transpose(X).compile()
+    npt.assert_allclose(fn(X=X_), X_.T)
+
+def test_dimshuffle():
+    fn = dimshuffle(T, 2, 0, 1).compile()
+    npt.assert_allclose(fn(T=T_), np.transpose(T_, (2, 0, 1)))
+
+def test_dimshuffle_broadcasting():
+    fn = add(X, dimshuffle(x, 0, 'x')).compile()
+    npt.assert_allclose(fn(X=X_, x=x_), X_ + x_[:, np.newaxis])
+
+    fn = mul(X, dimshuffle(x, 'x', 0)).compile()
+    npt.assert_allclose(fn(X=X_, x=x_), X_ * x_[np.newaxis, :])
+
+def test_trace():
+    fn = trace(X).compile()
+    npt.assert_allclose(fn(X=X_), np.trace(X_))
+
+def test_diagonal():
+    fn = diagonal(X).compile()
+    npt.assert_allclose(fn(X=X_), np.diagonal(X_))
+
+def test_outer():
+    fn = outer(x, y).compile()
+    npt.assert_allclose(fn(x=x_, y=y_), np.outer(x_, y_))
+
+def test_sum():
+    fn = sum(T).compile()
+    npt.assert_allclose(fn(T=T_), T_.sum(), rtol=1e-5)
+
+    fn = sum(T, axis=0).compile()
+    npt.assert_allclose(fn(T=T_), T_.sum(axis=0), rtol=1e-5)
+
+    fn = sum(T, axis=(0, 2)).compile()
+    npt.assert_allclose(fn(T=T_), T_.sum(axis=(0, 2)), rtol=1e-5)

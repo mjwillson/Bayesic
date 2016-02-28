@@ -76,7 +76,7 @@ class InputExpression(Expression):
 
 
 
-class Add(Expression):
+class add(Expression):
     def __init__(self, *terms):
         # associativity means we can avoid sums within sums
         flattened_terms = [t for term in terms for t in term.terms()]
@@ -86,7 +86,7 @@ class Add(Expression):
         if not all(t.ndim == self.ndim and t.dtype == self.dtype for t in flattened_terms):
             raise ValueError("Add requires same ndim, dtype on all terms")
 
-        super(Add, self).__init__(flattened_terms)
+        super(add, self).__init__(flattened_terms)
 
     def terms(self):
         return self.parents
@@ -122,34 +122,55 @@ class Einsum(Expression):
     f(X, Y, Z)_{a,b,c} = sum_{i,j} X_{a,i} Y_{i,j,b} Z_{c, j}
     """
 
-    def __init__(self, *factors_and_indices):
+    def __init__(self, factors_and_indices, ndim=None):
         """`factors_and_indices` -- pairs of (factor, indices)
         where indices contains an index for each axis of the factor.
 
         Indices are either ('sum', n) or ('out', n).
 
-        A sum index will be summed over; an out index matches an axis
-        of the output tensor.
+        A sum index will be summed over; an out index corresponds to
+        an axis of the output tensor. E.g. let s0, s1 be sum
+        indices, and o0, o1, o2 output indices. Then
+
+        Einsum([(X, (o2, s0, o1), (Y, (s0, s1, o0, o1)])
+
+        corresponds to a tensor T whose entries are:
+
+        T_{o0, o1, o2} = sum_{s0, s1} X_{o2, s0, o1} Y_{s0, s1, o0, o1}
+
+        `ndim` is the number of 'out' indices. If not specified it'll
+        be set to max index + 1. Note that not every output index in
+        range(0, ndim) needs to occur -- if an output index doesn't
+        occur, it'll correspond to a broadcastable axis in the output
+        tensor (see docs on theano broadcasting)
 
         """
         self.factors_and_indices = factors_and_indices
         if not all(f.ndim == len(indices) for f, indices in factors_and_indices):
             raise ValueError("The indices for each factor must have same length as factor.ndim")
 
-        output_nums = set(
+        output_nums = [
             num for factors, indices in factors_and_indices
             for type_, num in indices
             if type_ == 'out'
-        )
+        ]
+        if ndim is None:
+            ndim = max(output_nums) + 1
+        if not all(num >= 0 and num < ndim for num in output_nums):
+            raise ValueError("some output indices are out of range")
+        self.ndim = ndim
+
+        # Doesn't matter what the sum index numbers are exactly, since
+        # they don't index into a tensor. Just that we can compare
+        # them for equality, and sort them to determine the order of
+        # summation (which doesn't matter algebraically but might
+        # computationally)
         self.sum_nums = sorted(set(
             num for factors, indices in factors_and_indices
             for type_, num in indices
             if type_ == 'sum'
         ))
 
-        if not all(num in output_nums for num in range(len(output_nums))):
-            raise ValueError("some output index numbers are missing")
-        self.ndim = len(output_nums)
         self.dtype = factors_and_indices[0][0].dtype
         if not all(f.dtype == self.dtype for f, _ in factors_and_indices):
             raise ValueError("Add requires same dtype on all factors")
@@ -174,10 +195,26 @@ class Einsum(Expression):
             indices = tuple([i for n, i in enumerate(indices) if n != axis1 and n != axis2] + [dupe])
 
     def _apply_to_parents(self, *factor_vars):
+        # First eliminate any duplicate indices into the same input
+        # tensor, via extracting diagonals. This will ensure each
+        # index appears at most once in each tensor, which will help
+        # later:
         vars_and_indices = [
             self._eliminate_duplicate_indices(var, indices)
             for var, (factor, indices) in zip(factor_vars, self.factors_and_indices)
         ]
+
+        # Now a simple approach: dimshuffle all tensors so they line
+        # up, with one axis per (sum or output) index and so that they
+        # broadcast over any indices that don't appear. Then just
+        # multiply them, and then sum over the sum axes.
+        #
+        # This can be very slow, since it creates a big (potentially
+        # high-dimensional) intermediate result tensor.
+        #
+        # TODO: we can do better than this by spotting sums that are
+        # reducible to matrix-matrix, matrix-vector products. For now
+        # just worrying about the algebra though.
 
         def axis_of(index, indices):
             try:
@@ -223,16 +260,19 @@ def dot(X, Y):
     and the first of Y."""
     X_indices = [('out', i) for i in range(X.ndim-1)] + [('sum', 0)]
     Y_indices = [('sum', 0)] + [('out', i) for i in range(X.ndim - 1, X.ndim + Y.ndim - 2)]
-    return Einsum((X, X_indices), (Y, Y_indices))
+    return Einsum(((X, X_indices), (Y, Y_indices)), X.ndim + Y.ndim - 2)
 
-def prod(*args):
+def mul(*args):
     """Element-wise / hadamard product of some tensors."""
-    # TODO check ndims all the same
+    ndim = args[0].ndim
+    if not all(a.ndim == ndim for a in args):
+        raise ValueError("all ndim's must match for elemwise mul")
+
     args_and_indices = [
         (arg, [('out', i) for i in range(arg.ndim)])
         for arg in args
     ]
-    return Einsum(*args_and_indices)
+    return Einsum(args_and_indices, ndim)
 
 def outer(X, Y):
     """Outer product of two tensors, a.k.a. tensor product.
@@ -244,7 +284,7 @@ def outer(X, Y):
     """
     X_indices = [('out', i) for i in range(X.ndim)]
     Y_indices = [('out', i) for i in range(X.ndim, X.ndim + Y.ndim)]
-    return Einsum((X, X_indices), (Y, Y_indices))
+    return Einsum([(X, X_indices), (Y, Y_indices)], X.ndim + Y.ndim)
 
 def sum(X, axis=None):
     """Sum entries along all axes, or the given axis (or axes) only if specified"""
@@ -260,17 +300,33 @@ def sum(X, axis=None):
         else:
             indices.append(('out', out_index))
             out_index += 1
-    return Einsum((X, indices))
+    return Einsum([(X, indices)], out_index)
 
 def trace(X):
     # TODO could specify axes
-    return Einsum((X, [('sum', 0), ('sum', 0)]))
+    return Einsum([(X, [('sum', 0), ('sum', 0)])], 0)
 
 def diagonal(X):
     # TODO could specify axes
-    return Einsum((X, [('out', 0), ('out', 0)]))
+    return Einsum([(X, [('out', 0), ('out', 0)])], 1)
 
 def transpose(X):
-    return Einsum((X, [('out', i) for i in reversed(range(X.ndim))]))
+    return dimshuffle(X, *reversed(range(X.ndim)))
 
-# TODO: tensor_dot, batched_dot, dimshuffle,
+def dimshuffle(X, *axes):
+    """Like theano's dimshuffle. As there, 'x' can be used to indicate a
+    broadcastable axis.
+
+    """
+    indices = [None] * X.ndim
+    for output_no, axis in enumerate(axes):
+        if axis != 'x':
+            if indices[axis] is not None:
+                raise ValueError("dimshuffle: same input axis can't occur twice")
+            indices[axis] = ('out', output_no)
+    if any(i is None for i in indices):
+        raise ValueError("dimshuffle: can't drop an axis")
+
+    return Einsum([(X, indices)], len(axes))
+
+# TODO: tensor_dot, batched_dot
