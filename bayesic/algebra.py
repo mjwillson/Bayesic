@@ -56,6 +56,10 @@ class Expression(object):
         """self must be equivalent to Sum(self.terms)"""
         return [self]
 
+    def as_einsum(self):
+        indices = [('out', i) for i in range(self.ndim)]
+        return Einsum([(self, indices)], self.ndim)
+
 
 class InputExpression(Expression):
     def __init__(self, name, ndim, dtype='float32'):
@@ -118,8 +122,6 @@ class Einsum(Expression):
     dot, tensor_dot, batched_dot, outer, transpose / dimshuffle,
     diagonal, trace, sum along some axes, elemwise product, and
     various things inbetween.
-
-    f(X, Y, Z)_{a,b,c} = sum_{i,j} X_{a,i} Y_{i,j,b} Z_{c, j}
     """
 
     def __init__(self, factors_and_indices, ndim=None):
@@ -145,7 +147,6 @@ class Einsum(Expression):
         tensor (see docs on theano broadcasting)
 
         """
-        self.factors_and_indices = factors_and_indices
         if not all(f.ndim == len(indices) for f, indices in factors_and_indices):
             raise ValueError("The indices for each factor must have same length as factor.ndim")
 
@@ -160,22 +161,72 @@ class Einsum(Expression):
             raise ValueError("some output indices are out of range")
         self.ndim = ndim
 
-        # Doesn't matter what the sum index numbers are exactly, since
-        # they don't index into a tensor. Just that we can compare
-        # them for equality, and sort them to determine the order of
-        # summation (which doesn't matter algebraically but might
-        # computationally)
-        self.sum_nums = sorted(set(
-            num for factors, indices in factors_and_indices
-            for type_, num in indices
-            if type_ == 'sum'
-        ))
+        # If the factors are themselves Einsums, we swallow them up,
+        # incorporating their factors into ours. This means first
+        # building a mapping of the sum indices from all the separate
+        # Einsum factors, as well as our own sum indices, into a
+        # single combined namespace / range:
+        sums = 0
+        index_mapping = {}
+        for factor, indices in factors_and_indices:
+            if isinstance(factor, Einsum):
+                for i in range(factor.sums):
+                    index_mapping[(factor, ('sum', i))] = ('sum', sums)
+                    sums += 1
+
+        for factors, indices in factors_and_indices:
+            for type_, i in indices:
+                if type_ == 'sum' and (self, ('sum', i)) not in index_mapping:
+                    index_mapping[(self, ('sum', i))] = ('sum', sums)
+                    sums += 1
+
+        self.sums = sums
+        def map_idx(parent, i):
+            # sum indices will get mapped; out indices passed through.
+            return index_mapping.get((parent, i), i)
+
+        # Now we can map the factors of each parent Einsum factor, up
+        # to a factor of ourself.
+        self.factors_and_indices = []
+        for parent, parent_in_self in factors_and_indices:
+            if isinstance(parent, Einsum):
+                parent_factors_and_indices = parent.factors_and_indices
+            else:
+                # Treat parent as an identity einsum if it's not
+                # already on Einsum:
+                parent_factors_and_indices = [(parent, [('out', i) for i in range(parent.ndim)])]
+
+            for factor, factor_in_parent in parent_factors_and_indices:
+                factor_in_self = []
+                for type_, i in factor_in_parent:
+                    if type_ == 'out':
+                        # out index with respect to its parent -- we
+                        # then look up what index that axis of the
+                        # parent expression, has in the ourself (the
+                        # top-level expression). In case that index is
+                        # a sum index, we need to map it as our
+                        # top-level sum indices may have been shifted
+                        # up by all the sum indices taken from the
+                        # einsums beneath us. If it's an out index for
+                        # the top-level expression then it gets left
+                        # as such.
+                        factor_in_self.append(map_idx(self, parent_in_self[i]))
+                    elif type_ == 'sum':
+                        # sum index with respect to this particular
+                        # parent einsum. We look up what top-level sum
+                        # index to map it to.
+                        factor_in_self.append(map_idx(parent, ('sum', i)))
+                self.factors_and_indices.append((factor, factor_in_self))
 
         self.dtype = factors_and_indices[0][0].dtype
-        if not all(f.dtype == self.dtype for f, _ in factors_and_indices):
-            raise ValueError("Add requires same dtype on all factors")
 
-        super(Einsum, self).__init__([f for f, _ in factors_and_indices])
+        # Could relax this across the board, it'd just mean having to
+        # replicate the knowledge about which output dtypes you get
+        # from which combinations of inputs:
+        if not all(f.dtype == self.dtype for f, _ in factors_and_indices):
+            raise ValueError("Einsum requires same dtype on all factors")
+
+        super(Einsum, self).__init__([f for f, _ in self.factors_and_indices])
 
     @property
     def output_type(self):
@@ -224,14 +275,17 @@ class Einsum(Expression):
 
         def shuffle_to_axes(factor_indices):
             return [axis_of(('out', num), factor_indices) for num in range(self.ndim)] + \
-                [axis_of(('sum', num), factor_indices) for num in self.sum_nums]
+                [axis_of(('sum', num), factor_indices) for num in range(self.sums)]
 
         aligned_vars = [
             var.dimshuffle(*shuffle_to_axes(factor_indices))
             for var, factor_indices in vars_and_indices
         ]
-        sum_axes_in_output = list(range(self.ndim, self.ndim + len(self.sum_nums)))
+        sum_axes_in_output = list(range(self.ndim, self.ndim + self.sums))
         return T.mul(*aligned_vars).sum(axis=sum_axes_in_output)
+
+    def as_einsum(self):
+        return self
 
     def __repr__(self):
         def letter_for_index(type, num):
@@ -250,7 +304,7 @@ class Einsum(Expression):
             "%r_%s" % (factor, ''.join(letter_for_index(*i) for i in indices))
             for factor, indices in self.factors_and_indices
         )
-        sum_letters = ''.join(letter_for_index('sum', n) for n in self.sum_nums)
+        sum_letters = ''.join(letter_for_index('sum', n) for n in range(self.sums))
         output_letters = ''.join(letter_for_index('out', n) for n in range(self.ndim))
         return 'Einsum(out_%s = sum_%s %s)' % (output_letters, sum_letters, product)
 

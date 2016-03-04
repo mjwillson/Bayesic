@@ -88,3 +88,29 @@ def test_sum():
 
     fn = sum(T, axis=(0, 2)).compile()
     npt.assert_allclose(fn(T=T_), T_.sum(axis=(0, 2)), rtol=1e-5)
+
+# Test combining of einsums:
+
+def test_composition_of_einsums_collapses_to_single_einsum():
+    expr = dot(diagonal(dot(X, outer(x, y))), Y)
+    # no einsum parents
+    assert expr.parents == [X, x, y, Y]
+    # check it works
+    npt.assert_allclose(
+        expr.compile()(x=x_, y=y_, X=X_, Y=Y_),
+        np.dot(np.diagonal(np.dot(X_, np.outer(x_, y_))), Y_),
+        rtol=1e-5
+    )
+
+def test_two_equivalent_einsum_expressions_same_result():
+    # two equivalent expressions:
+    expr = trace(dot(transpose(X), Y))
+    expr2 = sum(mul(X, Y))
+    assert expr.parents == [X, Y]
+    assert expr2.parents == [X, Y]
+
+    # can't always rely on this being the case for algebraically
+    # equivalent einsum expressions, since we preserve some
+    # information about the order of sums which doesn't matter
+    # algebraically. But in this case that's equal too:
+    assert expr.factors_and_indices == expr2.factors_and_indices
