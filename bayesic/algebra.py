@@ -4,6 +4,7 @@ sadly we need smarter algebra than theano, and better symbolic tensor
 support than sympy.
 
 """
+import numpy as np
 import theano
 import theano.tensor as T
 from collections import Counter
@@ -23,7 +24,7 @@ class Expression(object):
                 result[name] = type_
         return result
 
-    # also must have properties ndim, dtype
+    # also must have property ndim
 
     def apply(self, inputs):
         """Given theano variables for the inputs, return a theano variable for
@@ -44,6 +45,7 @@ class Expression(object):
         fn = theano.function(inputs, expression)
         def f(**inputs):
             return fn(*(inputs[name] for name in input_names))
+        f.theano_fn = fn
         return f
 
     def _apply_to_parents(self, *parent_vars):
@@ -52,21 +54,21 @@ class Expression(object):
     def __repr__(self):
         return "%s(%s)" % (type(self).__name__, ', '.join(repr(x) for x in self.parents))
 
+    def bracketed_repr(self):
+        return '(%r)' % self
+
     def terms(self):
         """self must be equivalent to Sum(self.terms)"""
         return [self]
 
-    def as_einsum(self):
-        indices = [('out', i) for i in range(self.ndim)]
-        return Einsum([(self, indices)], self.ndim)
 
 
-class InputExpression(Expression):
+class var(Expression):
     def __init__(self, name, ndim, dtype='float32'):
         self.name = name
         self.ndim = ndim
         self.dtype = dtype
-        super(InputExpression, self).__init__([])
+        super(var, self).__init__([])
 
     @property
     def input_types(self):
@@ -78,25 +80,84 @@ class InputExpression(Expression):
     def __repr__(self):
         return self.name
 
+    bracketed_repr = __repr__
 
 
-class add(Expression):
+class constant(Expression):
+    def __init__(self, value):
+        self.value = value
+        self._constant = T.constant(value)
+        self.ndim = self._constant.ndim
+        self.dtype = self._constant.dtype
+        super(constant, self).__init__([])
+
+    def apply(self, inputs):
+        return self._constant
+
+    def __repr__(self):
+        return repr(self.value)
+
+    bracketed_repr = __repr__
+
+
+def wrap_if_literal(x):
+    if np.isscalar(x) or isinstance(x, np.ndarray):
+        return constant(x)
+    elif isinstance(x, Expression):
+        return x
+    else:
+        raise ValueError("must be a scalar, numpy array or Expression")
+
+
+def with_wrapped_literals(fn):
+    def wrapped_fn(*args):
+        return fn(*(wrap_if_literal(x) for x in args))
+    return wrapped_fn
+
+
+def autobroadcast_or_match(X, ndim):
+    """Ensure `X` has `ndim`.
+
+    A scalar get auto-broadcasted, but otherwise `ndim` must match.
+
+    """
+    if X.ndim == ndim:
+        return X
+    elif X.ndim == 0:
+        return dimshuffle(X, *(['x'] * ndim))
+    else:
+        raise ValueError("Dimension mismatch. If you want broadcasting you need to do it explicitly via dimshuffle")
+
+
+class elemwise(Expression):
+    """Wraps an element-wise theano op (or op-like-function)"""
+    def __init__(self, theano_op, *args, name=None):
+        args = [wrap_if_literal(x) for x in args]
+        self.ndim = max(arg.ndim for arg in args)
+        args = [autobroadcast_or_match(arg, self.ndim) for arg in args]
+        self._apply_to_parents = theano_op
+        self.name = name or theano_op.scalar_op.name
+        super(elemwise, self).__init__(args)
+
+    def __repr__(self):
+        return "%s(%s)" % (self.name, ', '.join(repr(x) for x in self.parents))
+
+
+class add(elemwise):
     def __init__(self, *terms):
         # associativity means we can avoid sums within sums
-        flattened_terms = [t for term in terms for t in term.terms()]
-
-        self.ndim = flattened_terms[0].ndim
-        self.dtype = flattened_terms[0].dtype
-        if not all(t.ndim == self.ndim and t.dtype == self.dtype for t in flattened_terms):
-            raise ValueError("Add requires same ndim, dtype on all terms")
-
-        super(add, self).__init__(flattened_terms)
+        flattened_terms = [
+            t for term in terms for t in wrap_if_literal(term).terms()]
+        super(add, self).__init__(T.add, *flattened_terms)
 
     def terms(self):
         return self.parents
 
     def _apply_to_parents(self, *term_vars):
         return T.add(*term_vars)
+
+    def __repr__(self):
+        return ' + '.join(repr(x) for x in self.parents)
 
 
 def find_duplicate(values):
@@ -112,7 +173,7 @@ def find_duplicate(values):
         seen[v] = i
 
 
-class Einsum(Expression):
+class einsum(Expression):
     """This is a general form for various kinds of products between
     tensors, and other multilinear functions of tensors, similar to
     numpy.einsum.
@@ -134,7 +195,7 @@ class Einsum(Expression):
         an axis of the output tensor. E.g. let s0, s1 be sum
         indices, and o0, o1, o2 output indices. Then
 
-        Einsum([(X, (o2, s0, o1), (Y, (s0, s1, o0, o1)])
+        einsum([(X, (o2, s0, o1), (Y, (s0, s1, o0, o1)])
 
         corresponds to a tensor T whose entries are:
 
@@ -161,15 +222,15 @@ class Einsum(Expression):
             raise ValueError("some output indices are out of range")
         self.ndim = ndim
 
-        # If the factors are themselves Einsums, we swallow them up,
+        # If the factors are themselves einsums, we swallow them up,
         # incorporating their factors into ours. This means first
         # building a mapping of the sum indices from all the separate
-        # Einsum factors, as well as our own sum indices, into a
+        # einsum factors, as well as our own sum indices, into a
         # single combined namespace / range:
         sums = 0
         index_mapping = {}
         for factor, indices in factors_and_indices:
-            if isinstance(factor, Einsum):
+            if isinstance(factor, einsum):
                 for i in range(factor.sums):
                     index_mapping[(factor, ('sum', i))] = ('sum', sums)
                     sums += 1
@@ -185,16 +246,17 @@ class Einsum(Expression):
             # sum indices will get mapped; out indices passed through.
             return index_mapping.get((parent, i), i)
 
-        # Now we can map the factors of each parent Einsum factor, up
+        # Now we can map the factors of each parent einsum factor, up
         # to a factor of ourself.
         self.factors_and_indices = []
         for parent, parent_in_self in factors_and_indices:
-            if isinstance(parent, Einsum):
+            if isinstance(parent, einsum):
                 parent_factors_and_indices = parent.factors_and_indices
             else:
                 # Treat parent as an identity einsum if it's not
-                # already on Einsum:
-                parent_factors_and_indices = [(parent, [('out', i) for i in range(parent.ndim)])]
+                # already on einsum:
+                parent_factors_and_indices = [
+                    (wrap_if_literal(parent), [('out', i) for i in range(parent.ndim)])]
 
             for factor, factor_in_parent in parent_factors_and_indices:
                 factor_in_self = []
@@ -218,15 +280,7 @@ class Einsum(Expression):
                         factor_in_self.append(map_idx(parent, ('sum', i)))
                 self.factors_and_indices.append((factor, factor_in_self))
 
-        self.dtype = factors_and_indices[0][0].dtype
-
-        # Could relax this across the board, it'd just mean having to
-        # replicate the knowledge about which output dtypes you get
-        # from which combinations of inputs:
-        if not all(f.dtype == self.dtype for f, _ in factors_and_indices):
-            raise ValueError("Einsum requires same dtype on all factors")
-
-        super(Einsum, self).__init__([f for f, _ in self.factors_and_indices])
+        super(einsum, self).__init__([f for f, _ in self.factors_and_indices])
 
     @property
     def output_type(self):
@@ -300,34 +354,53 @@ class Einsum(Expression):
                 except IndexError:
                     return 's%d' % num
 
+        def indexed_factor_repr(factor, indices):
+            if len(indices) == 0:
+                return factor.bracketed_repr()
+            else:
+                return "%s_%s" % (factor.bracketed_repr(),
+                                  ''.join(letter_for_index(*i) for i in indices))
+
         product = ' '.join(
-            "%r_%s" % (factor, ''.join(letter_for_index(*i) for i in indices))
-            for factor, indices in self.factors_and_indices
-        )
-        sum_letters = ''.join(letter_for_index('sum', n) for n in range(self.sums))
-        output_letters = ''.join(letter_for_index('out', n) for n in range(self.ndim))
-        return 'Einsum(out_%s = sum_%s %s)' % (output_letters, sum_letters, product)
+            indexed_factor_repr(factor, indices) for factor, indices in self.factors_and_indices)
 
+        if self.sums > 0:
+            sum_letters = ''.join(letter_for_index('sum', n) for n in range(self.sums))
+            summed_product = 'sum_%s %s' % (sum_letters, product)
+        else:
+            summed_product = product
 
+        if self.ndim > 0:
+            output_letters = ''.join(letter_for_index('out', n) for n in range(self.ndim))
+            return 'einsum(out_%s = %s)' % (output_letters, summed_product)
+        else:
+            return 'einsum(%s)' % summed_product
+
+# einsum-based ops:
+
+@with_wrapped_literals
 def dot(X, Y):
     """Inner / dot product of two tensors. Sums over the last axis of X
     and the first of Y."""
     X_indices = [('out', i) for i in range(X.ndim-1)] + [('sum', 0)]
     Y_indices = [('sum', 0)] + [('out', i) for i in range(X.ndim - 1, X.ndim + Y.ndim - 2)]
-    return Einsum(((X, X_indices), (Y, Y_indices)), X.ndim + Y.ndim - 2)
+    return einsum(((X, X_indices), (Y, Y_indices)), X.ndim + Y.ndim - 2)
 
+
+@with_wrapped_literals
 def mul(*args):
     """Element-wise / hadamard product of some tensors."""
-    ndim = args[0].ndim
-    if not all(a.ndim == ndim for a in args):
-        raise ValueError("all ndim's must match for elemwise mul")
+    ndim = max(arg.ndim for arg in args)
+    args = [autobroadcast_or_match(arg, ndim) for arg in args]
 
     args_and_indices = [
         (arg, [('out', i) for i in range(arg.ndim)])
         for arg in args
     ]
-    return Einsum(args_and_indices, ndim)
+    return einsum(args_and_indices, ndim)
 
+
+@with_wrapped_literals
 def outer(X, Y):
     """Outer product of two tensors, a.k.a. tensor product.
     Unlike theano's this generalises to all tensor shapes.
@@ -338,12 +411,14 @@ def outer(X, Y):
     """
     X_indices = [('out', i) for i in range(X.ndim)]
     Y_indices = [('out', i) for i in range(X.ndim, X.ndim + Y.ndim)]
-    return Einsum([(X, X_indices), (Y, Y_indices)], X.ndim + Y.ndim)
+    return einsum([(X, X_indices), (Y, Y_indices)], X.ndim + Y.ndim)
+
 
 def sum(X, axis=None):
     """Sum entries along all axes, or the given axis (or axes) only if specified"""
     if isinstance(axis, int): axis = [axis]
     if axis is None: axis = range(X.ndim)
+    X = wrap_if_literal(X)
     indices = []
     sum_index = 0
     out_index = 0
@@ -354,24 +429,32 @@ def sum(X, axis=None):
         else:
             indices.append(('out', out_index))
             out_index += 1
-    return Einsum([(X, indices)], out_index)
+    return einsum([(X, indices)], out_index)
 
+
+@with_wrapped_literals
 def trace(X):
     # TODO could specify axes
-    return Einsum([(X, [('sum', 0), ('sum', 0)])], 0)
+    return einsum([(X, [('sum', 0), ('sum', 0)])], 0)
 
+
+@with_wrapped_literals
 def diagonal(X):
     # TODO could specify axes
-    return Einsum([(X, [('out', 0), ('out', 0)])], 1)
+    return einsum([(X, [('out', 0), ('out', 0)])], 1)
 
+
+@with_wrapped_literals
 def transpose(X):
     return dimshuffle(X, *reversed(range(X.ndim)))
+
 
 def dimshuffle(X, *axes):
     """Like theano's dimshuffle. As there, 'x' can be used to indicate a
     broadcastable axis.
 
     """
+    X = wrap_if_literal(X)
     indices = [None] * X.ndim
     for output_no, axis in enumerate(axes):
         if axis != 'x':
@@ -381,6 +464,70 @@ def dimshuffle(X, *axes):
     if any(i is None for i in indices):
         raise ValueError("dimshuffle: can't drop an axis")
 
-    return Einsum([(X, indices)], len(axes))
+    return einsum([(X, indices)], len(axes))
 
 # TODO: tensor_dot, batched_dot
+
+# Elemwise ops
+
+@with_wrapped_literals
+def div(X, Y):
+    """Element-wise division"""
+    # doing it this way allows it to participate in einsum (via mul)
+    return mul(X, Y ** -1)
+
+
+@with_wrapped_literals
+def neg(X):
+    return -1 * X
+
+
+@with_wrapped_literals
+def sub(self, other):
+    return add(self, -other)
+
+
+def log(X):
+    return elemwise(T.log, X)
+
+
+def exp(X):
+    return elemwise(T.exp, X)
+
+
+def pow(X, Y):
+    return elemwise(T.pow, X, Y)
+
+
+def abs_(X):
+    return elemwise(T.abs_, X)
+
+
+# Add operator overloading:
+
+def _swap(fn):
+    def swapped(x, y):
+        return fn(y, x)
+    return swapped
+
+# add is a class, have to wrap to use as bindable method
+def _add(*args):
+    return add(*args)
+Expression.__add__ = _add
+Expression.__radd__ = _swap(add)
+Expression.__sub__ = sub
+Expression.__rsub__ = _swap(sub)
+Expression.__mul__ = mul
+Expression.__rmul__ = _swap(mul)
+Expression.__truediv__ = div
+Expression.__rtruediv__ = _swap(div)
+Expression.__pow__ = pow
+Expression.__rpow__ = _swap(pow)
+Expression.__matmul__ = dot
+Expression.__rmatmul__ = _swap(dot)
+Expression.__neg__ = neg
+Expression.__abs__ = abs_
+Expression.T = property(transpose)
+Expression.dimshuffle = dimshuffle
+Expression.sum = sum
+Expression.dot = dot
