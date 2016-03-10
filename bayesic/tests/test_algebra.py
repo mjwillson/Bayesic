@@ -4,6 +4,8 @@ import numpy.testing as npt
 import numpy as np
 import numpy.random as npr
 
+from nose_parameterized import parameterized
+
 npr.seed(1234)
 
 # Create some inputs, symbolic ones together with concrete numpy
@@ -177,3 +179,77 @@ def test_two_equivalent_einsum_expressions_same_result():
     # information about the order of sums which doesn't matter
     # algebraically. But in this case that's equal too:
     assert expr.factors_and_indices == expr2.factors_and_indices
+
+
+@parameterized([
+    ([1], []),
+    ([1, 1], [1]),
+    ([1, 1, 2], [1, 2])
+])
+def test_find_injections_none_possible(A, B):
+    assert list(find_injections(A, B)) == []
+
+@parameterized([
+    ([],     [],           []),
+    ([1],    [1],          [(1, 1)]),
+    ([1],    [1, 2],       [(1, 1)]),
+    ([1, 1], [1, 1],       [(1, 1), (1, 1)]),
+    ([1, 1], [1, 1, 2],    [(1, 1), (1, 1)]),
+    ([1, 2], [5, 2, 1, 3], [(1, 1), (2, 2)])
+])
+def test_find_injections_one_possible_with_equality_matching(A, B, injection):
+    result = list(find_injections(A, B))
+    assert result == [Counter(injection)]
+
+
+# second char must match
+def match(a, b):
+    return a[1] == b[1]
+
+
+@parameterized([
+    # no injections possible:
+    (["a1", "a1"], ["b1"]),
+    (["a1", "a1"], ["b1", "b2"]),
+    # one possible:
+    (["a1"],       ["b1"],             [("a1", "b1")]),
+    (["a1", "a3"], ["b3", "b1"],       [("a1", "b1"), ("a3", "b3")]),
+    (["a1", "a1"], ["a2", "b1", "c1"], [("a1", "b1"), ("a1", "c1")]),
+    (["a1", "a1"], ["a2", "b1", "c1"], [("a1", "b1"), ("a1", "c1")]),
+    (["a1", "b1"], ["c1", "c1", "d2"], [("a1", "c1"), ("b1", "c1")]),
+    # multiple possible:
+    # all 10 subsets of size 2, of 5 items:
+    (["a1", "a1"], ["a1", "b1", "c1", "d1", "e1"],
+     [("a1", "a1"), ("a1", "b1")],
+     [("a1", "a1"), ("a1", "c1")],
+     [("a1", "a1"), ("a1", "d1")],
+     [("a1", "a1"), ("a1", "e1")],
+     [("a1", "b1"), ("a1", "c1")],
+     [("a1", "b1"), ("a1", "d1")],
+     [("a1", "b1"), ("a1", "e1")],
+     [("a1", "c1"), ("a1", "d1")],
+     [("a1", "c1"), ("a1", "e1")],
+     [("a1", "d1"), ("a1", "e1")]),
+    # all partitions of a set of 4 elements into two partitions of
+    # size 2:
+    (["a1", "a1", "b1", "b1"], ["w1", "x1", "y1", "z1"],
+     [("a1", "w1"), ("a1", "x1"), ("b1", "y1"), ("b1", "z1")],
+     [("a1", "w1"), ("b1", "x1"), ("a1", "y1"), ("b1", "z1")],
+     [("b1", "w1"), ("a1", "x1"), ("a1", "y1"), ("b1", "z1")],
+     [("a1", "w1"), ("b1", "x1"), ("b1", "y1"), ("a1", "z1")],
+     [("b1", "w1"), ("a1", "x1"), ("b1", "y1"), ("a1", "z1")],
+     [("b1", "w1"), ("b1", "x1"), ("a1", "y1"), ("a1", "z1")]),
+    (["a1", "b1"], ["x1", "y1", "z2"],
+     [("a1", "x1"), ("b1", "y1")],
+     [("a1", "y1"), ("b1", "x1")]),
+    (["a1", "a1", "a1", "b2"], ["x1", "x1", "x1", "y1", "y1", "z2", "extra"],
+     {("b2", "z2"): 1, ("a1", "x1"): 3},
+     {("b2", "z2"): 1, ("a1", "x1"): 2, ("a1", "y1"): 1},
+     {("b2", "z2"): 1, ("a1", "x1"): 1, ("a1", "y1"): 2})
+])
+def test_find_injections_with_nonequality_match(A, B, *injections):
+    # We need to compare multisets of multisets, which is a bit fiddly as
+    # Counter isn't hashable:
+    result = Counter(frozenset(c.items()) for c in find_injections(A, B, match))
+    expected = Counter(frozenset(Counter(i).items()) for i in injections)
+    assert result == expected

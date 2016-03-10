@@ -7,6 +7,8 @@ support than sympy.
 import numpy as np
 import theano
 import theano.tensor as T
+
+import itertools as it
 from collections import Counter
 
 class Expression(object):
@@ -376,10 +378,114 @@ class einsum(Expression):
         else:
             return 'einsum(%s)' % summed_product
 
+    def match(self, template, slot):
+        """Try to pattern-match this einsum expression against a template
+        einsum expression which contains a var `slot` as exactly one
+        of its factors.
+
+        Returns an einsum which, when substituted for `slot` in the
+        template, is equal to self -- if this is possible, otherwise
+        None.
+
+        This is a general way of pulling out some factor(s) out of an
+        einsum, and of testing if it has a particular factor(s),
+        noting that it's not just the identity of the factor that
+        matters, but the way it's multiplied/combined with other
+        factors (as specified by the way the `slot` is combined with
+        the other terms in the template). Useful for identifying and
+        collecting like terms in a sum.
+
+        """
+        try:
+            slot_indices = next(
+                indices for factor, indices in template.factors_and_indices if factor is slot)
+        except StopIteration:
+            raise ValueError("template must contain slot as a factor")
+
+        nonslots = [fi for fi in template.factors_and_indices if factor is not slot]
+        # Each nonslot factor in the template might occur multiple
+        # times in self. We might need to try different combinations
+        # of matches to find one where the indices line up:
+        per_factor_match_candidates = [
+            [f for f, _ in self.factors_and_indices if f == factor]
+            for factor, _ in nonslots
+        ]
+        # We consider the full cartesian product of all these matches.
+        # (TODO we could probably filter them a bit more earlier, but
+        # it's expected to be fairly rare to have that many factors
+        # here)
+        match_candidates = it.product(*per_factor_match_candidates)
+
+
+def submultisets_of_size(A, n):
+    """Enumerate all sub-multisets of a given multiset, with a given size.
+
+    A should be a Counter.
+
+    It might help to view this algorithm as a generalization of
+    "generate all subsets of size n of a set", whose inductive step is
+    f(S, n) = f(S \ {s}, n) + f(S \ {s}, n-1)
+
+    """
+    if not A:
+        if n == 0: yield Counter([])
+        return
+    A_remaining = A.copy()
+    a, a_count = A_remaining.popitem()
+
+    for count_to_include in range(0, min(a_count, n)+1):
+        a_s = Counter({a: count_to_include})
+        for S in submultisets_of_size(A_remaining, n - count_to_include):
+            yield a_s + S
+
+
+def find_injections(A, B, match=lambda a, b: a == b):
+    """Find all injections (i.e. one-to-one mappings) f from multiset A to
+    multiset B, satisfying match(a, f(a)) for all a.
+
+    A and B can be given as lists, or as Counters/Counter-like dicts
+    with counts as values.
+
+    Injections are yielded as Counters of pairs (a, b), such that:
+
+    Counter(b for a, b in f) is a sub-multiset of Counter(B)
+
+    i.e. this is an injection of multisets -- each b in B can be
+    mapped to at most once if it occurs once in B, at most twice if it
+    occurs twice etc.
+
+    all(match(a, b) for a, b in f) -- the match property requested
+
+    Counter(A) == Counter(a for a, b in f) -- i.e. has a corresponding
+    occurrence in B for every occurrence in A
+
+    """
+    def _find_injections(A, B):
+        if not A:
+            yield Counter([])
+            return
+        A_remaining = A.copy()
+        a, a_count = A_remaining.popitem()
+
+        # Enumerate all the ways to allocate a's count to matching b's:
+        all_matching_bs = Counter({b: count for b, count in B.items() if match(a, b)})
+        for matching_bs in submultisets_of_size(all_matching_bs, a_count):
+            ab_s = Counter({(a, b): n for b, n in matching_bs.items()})
+            # Then recursively match up all the remaining items. This
+            # may blow the stack for large input. Input not expected
+            # to be large, but if that changes could rewrite
+            B_remaining = B - matching_bs
+            for inj in _find_injections(A_remaining, B_remaining):
+                yield ab_s + inj
+
+    return _find_injections(Counter(A), Counter(B))
+
+
 # einsum-based ops:
 
 @with_wrapped_literals
 def dot(X, Y):
+
     """Inner / dot product of two tensors. Sums over the last axis of X
     and the first of Y."""
     X_indices = [('out', i) for i in range(X.ndim-1)] + [('sum', 0)]
