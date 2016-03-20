@@ -16,6 +16,7 @@ def randn(*shape):
 # Some square matrices
 X = var('X', 2)
 Y = var('Y', 2)
+Z = var('Z', 2)
 X_ = randn(5, 5)
 Y_ = randn(5, 5)
 
@@ -89,7 +90,7 @@ def test_mul():
 
 def test_div():
     fn = (X / Y).compile()
-    npt.assert_allclose(fn(X=X_, Y=Y_), X_ / Y_)
+    npt.assert_allclose(fn(X=X_, Y=Y_), X_ / Y_, rtol=1e-5)
 
 
 def test_pow():
@@ -158,7 +159,7 @@ def test_sum():
 def test_composition_of_einsums_collapses_to_single_einsum():
     expr = dot(diagonal(dot(X, outer(x, y))), Y)
     # no einsum parents
-    assert expr.parents == [X, x, y, Y]
+    assert expr.parents == (X, x, y, Y)
     # check it works
     npt.assert_allclose(
         expr.compile()(x=x_, y=y_, X=X_, Y=Y_),
@@ -171,8 +172,8 @@ def test_two_equivalent_einsum_expressions_same_result():
     # two equivalent expressions:
     expr = trace(dot(X.T, Y))
     expr2 = sum(X * Y)
-    assert expr.parents == [X, Y]
-    assert expr2.parents == [X, Y]
+    assert expr.parents == (X, Y)
+    assert expr2.parents == (X, Y)
 
     # can't always rely on this being the case for algebraically
     # equivalent einsum expressions, since we preserve some
@@ -253,3 +254,54 @@ def test_find_injections_with_nonequality_match(A, B, *injections):
     result = Counter(frozenset(c.items()) for c in find_injections(A, B, match))
     expected = Counter(frozenset(Counter(i).items()) for i in injections)
     assert result == expected
+
+
+def test_equality_of_expressions():
+    # Equality of expressions knows about some simple algebraic
+    # equivalences, and is relatively smart for einsums, but don't
+    # count on it doing any other more complicated algebraic
+    # simplifications in order to prove equivalence.
+    assert X == X
+    assert X != Y
+    assert constant(1) == constant(1)
+    assert constant(1) != constant(2)
+    assert X + Y == X + Y
+    assert X + Y == Y + X
+    assert X + Y != X + Z
+    # These are a bit lucky, just due to the way - and / are
+    # implemented:
+    assert X - Y == -Y + X
+    assert X / Y == X * (Y ** -1)
+    assert log(X) == log(X)
+    assert log(X) != exp(X)
+    assert log(X) != log(Y)
+
+    assert X * Y == Y * X
+    assert X * X.T == X.T * X
+    assert X * X.T != X * X
+    assert X * X.T == X.T * X
+
+    assert dot(X, Y) == dot(Y.T, X.T).T
+
+    assert sum(X * X.T) == sum(X.T * X)
+    assert sum(X * X.T) != trace(X) * trace(X)
+
+    assert trace(dot(X, Y.T)) == sum(Y * X)
+
+
+def test_match():
+    # slightly circular as match is used in einsum.__eq__
+    assert (X * Y).match(X * Z, Z) == Y
+    assert (X * X).match(X * Z, Z) == X
+    assert (X * X).match(Y * Z, Z) is None
+    assert (Y * X).match(X * Z, Z) == Y
+    assert sum(Y * X).match(sum(X * Z), Z) == Y
+    assert dot(X, Y).match(dot(X, Z), Z) == Y
+
+    assert dot(X, Y).T.match(dot(X, Z), Z) is None
+    assert dot(X, Y).T.match(dot(X.T, Z), Z) is None
+    assert dot(X, Y).T.match(dot(Z, X.T), Z) == Y.T
+
+    assert dot(X, dot(Y, X)).match(dot(X, Z), Z) == dot(Y, X)
+
+    assert (X * Y).match(Z, Z) == X*Y

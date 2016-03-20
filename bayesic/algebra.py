@@ -13,7 +13,7 @@ from collections import Counter, defaultdict
 
 class Expression(object):
     def __init__(self, parents):
-        self.parents = parents
+        self.parents = tuple(parents)
 
     @property
     def input_types(self):
@@ -63,6 +63,23 @@ class Expression(object):
         """self must be equivalent to Sum(self.terms)"""
         return [self]
 
+    def _equality_by(self):
+        """Should return a hashable value which equality is based on for
+        instances of this type (or override __eq__ and __hash__
+        yourself)
+
+        """
+        return self.parents
+
+    def __eq__(self, other):
+        return isinstance(other, self.__class__) \
+            and self._equality_by() == other._equality_by()
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __hash__(self):
+        return hash(self._equality_by())
 
 
 class var(Expression):
@@ -84,6 +101,9 @@ class var(Expression):
 
     bracketed_repr = __repr__
 
+    def _equality_by(self):
+        return self.name
+
 
 class constant(Expression):
     def __init__(self, value):
@@ -100,6 +120,10 @@ class constant(Expression):
         return repr(self.value)
 
     bracketed_repr = __repr__
+
+    def _equality_by(self):
+        return self.value
+
 
 
 def wrap_if_literal(x):
@@ -128,7 +152,9 @@ def autobroadcast_or_match(X, ndim):
     elif X.ndim == 0:
         return dimshuffle(X, *(['x'] * ndim))
     else:
-        raise ValueError("Dimension mismatch. If you want broadcasting you need to do it explicitly via dimshuffle")
+        raise ValueError(
+            "Dimension mismatch, was %d, should be %d. If you want broadcasting "
+            "you need to do it explicitly via dimshuffle" % (X.ndim, ndim))
 
 
 class elemwise(Expression):
@@ -143,6 +169,9 @@ class elemwise(Expression):
 
     def __repr__(self):
         return "%s(%s)" % (self.name, ', '.join(repr(x) for x in self.parents))
+
+    def _equality_by(self):
+        return (self._apply_to_parents, self.parents)
 
 
 class add(elemwise):
@@ -160,6 +189,10 @@ class add(elemwise):
 
     def __repr__(self):
         return ' + '.join(repr(x) for x in self.parents)
+
+    def _equality_by(self):
+        """Making this a set means equality knows about commutativity of addition"""
+        return frozenset(self.parents)
 
 
 def find_duplicate(values):
@@ -186,6 +219,26 @@ class einsum(Expression):
     diagonal, trace, sum along some axes, elemwise product, and
     various things inbetween.
     """
+
+    def __new__(cls, factors_and_indices, ndim=None):
+        """Create an einsum, unless we have:
+
+        (a) an expression which is equivalent to the identity function
+        (a single factor whose indices are all outputs in the same
+        order), in which case just return that factor.
+
+        (b) an empty einsum, which is equivalent to a constant tensor
+        of 1's.
+
+        See einsum.__init__ for details on the constructor args.
+
+        """
+        if len(factors_and_indices) == 1:
+            factor, indices = factors_and_indices[0]
+            if (ndim is None or ndim == factor.ndim) and \
+               all(index == ('out', j) for index, j in zip(indices, range(factor.ndim))):
+                return factor
+        return super(einsum, cls).__new__(cls)
 
     def __init__(self, factors_and_indices, ndim=None):
         """`factors_and_indices` -- pairs of (factor, indices)
@@ -239,8 +292,8 @@ class einsum(Expression):
 
         for factors, indices in factors_and_indices:
             for type_, i in indices:
-                if type_ == 'sum' and (self, ('sum', i)) not in index_mapping:
-                    index_mapping[(self, ('sum', i))] = ('sum', sums)
+                if type_ == 'sum' and (None, ('sum', i)) not in index_mapping:
+                    index_mapping[(None, ('sum', i))] = ('sum', sums)
                     sums += 1
 
         self.sums = sums
@@ -274,13 +327,13 @@ class einsum(Expression):
                         # einsums beneath us. If it's an out index for
                         # the top-level expression then it gets left
                         # as such.
-                        factor_in_self.append(map_idx(self, parent_in_self[i]))
+                        factor_in_self.append(map_idx(None, parent_in_self[i]))
                     elif type_ == 'sum':
                         # sum index with respect to this particular
                         # parent einsum. We look up what top-level sum
                         # index to map it to.
                         factor_in_self.append(map_idx(parent, ('sum', i)))
-                self.factors_and_indices.append((factor, factor_in_self))
+                self.factors_and_indices.append((factor, tuple(factor_in_self)))
 
         super(einsum, self).__init__([f for f, _ in self.factors_and_indices])
 
@@ -364,7 +417,8 @@ class einsum(Expression):
                                   ''.join(letter_for_index(*i) for i in indices))
 
         product = ' '.join(
-            indexed_factor_repr(factor, indices) for factor, indices in self.factors_and_indices)
+            indexed_factor_repr(factor, indices) for factor, indices in self.factors_and_indices) \
+            or '1'
 
         if self.sums > 0:
             sum_letters = ''.join(letter_for_index('sum', n) for n in range(self.sums))
@@ -377,6 +431,14 @@ class einsum(Expression):
             return 'einsum(out_%s = %s)' % (output_letters, summed_product)
         else:
             return 'einsum(%s)' % summed_product
+
+    @staticmethod
+    def _factor_axes_for_indices(indices_for_factors):
+        index_to_axes = defaultdict(set)
+        for factor_no, indices in enumerate(indices_for_factors):
+            for axis_no, index in enumerate(indices):
+                index_to_axes[index].add((factor_no, axis_no))
+        return {index: frozenset(axes) for index, axes in index_to_axes.items()}
 
     def match(self, template, slot):
         """Try to pattern-match this einsum expression against a template
@@ -396,6 +458,10 @@ class einsum(Expression):
         collecting like terms in a sum.
 
         """
+        # special-case this -- the only case we need to support where
+        # template isn't itself an einsum:
+        if template is slot: return self
+
         try:
             slot_indices = next(
                 indices for factor, indices in template.factors_and_indices if factor is slot)
@@ -413,7 +479,7 @@ class einsum(Expression):
             template_index_to_slot_axis[index] = axis
 
         self_factors_and_indices = Counter(self.factors_and_indices)
-        nonslots = [fi for fi in template.factors_and_indices if factor is not slot]
+        nonslots = [(f, i) for f, i in template.factors_and_indices if f is not slot]
         factor_injections = find_injections(nonslots, self_factors_and_indices,
                                             match=lambda a, b: a[0] == b[0])
         for factor_injection in factor_injections:
@@ -426,15 +492,8 @@ class einsum(Expression):
                     (factor, self_indices_for_factor) in factor_injection.elements())
             )
 
-            def factor_axes_for_indices(indices_for_factors):
-                index_to_axes = defaultdict(set)
-                for factor_no, indices in enumerate(indices_for_factors):
-                    for axis_no, index in enumerate(indices):
-                        index_to_axes[index].add((factor_no, axis_no))
-                return [(index, frozenset(axes)) for index, axes in index_to_axes.items()]
-
-            template_indices_and_axes = factor_axes_for_indices(template_indices)
-            self_indices_and_axes = factor_axes_for_indices(self_indices)
+            template_indices_and_axes = self._factor_axes_for_indices(template_indices).items()
+            self_indices_and_axes = self._factor_axes_for_indices(self_indices).items()
 
             def index_match(template_index_and_axes, self_index_and_axes):
                 (template_index_type, template_index_no), template_axes \
@@ -522,8 +581,57 @@ class einsum(Expression):
                 # If to_result_index returned None for any indices, we
                 # can't fit the remaining items in the slot, so give
                 # up on this match. Otherwise, we're done!
-                if not any(i is None for _, indices in result_factor_and_indices for i in indices):
+                if not any(i is None for _, indices in result_factors_and_indices for i in indices):
                     return einsum(result_factors_and_indices, ndim=slot.ndim)
+
+    def __eq__(self, other):
+        """We test equality by searching for an isomorphism using match. Sadly
+        it doesn't seem possible to find a uniquely-identifying
+        representative for the equivalence class that isn't sensitive
+        to numbering of the sum indices, nor to the ordering of the
+        factors. The case when a single factor occurs twice makes this
+        hard, in particular cases like sum_ij X_ii X_jj != sum_ij X_ij
+        X_ji == sum_ij X_ji X_ij.
+
+        """
+        slot = var('__slot__', ndim=0)
+        match = self.match(other * slot, slot)
+        return match is not None and len(match.factors_and_indices) == 0
+
+    def __hash__(self):
+        """As per comments on __eq__, finding a canonical equivalence class
+        representative to hash doesn't seem easy, so instead we hash
+        something which doesn't always uniquely identify self
+        (although it usually will). This is OK provided different
+        hashes implies nonequality, which is still the case.
+
+        """
+        # we represent each sum index as a multiset of (factor, axis)
+        # for how many times it occurs on a particular axis of a
+        # particular factor (which recall may occur multiple times):
+        sum_index_to_axes = defaultdict(Counter)
+        for factor, indices in self.factors_and_indices:
+            for axis_no, index in enumerate(indices):
+                if index[0] == 'sum':
+                    sum_index_to_axes[index][(factor, axis_no)] += 1
+        sum_index_to_axes = {index: frozenset(axes.items())
+                             for index, axes in sum_index_to_axes.items()}
+
+        factor_axes_for_indices = self._factor_axes_for_indices(
+            indices for factor, indices in self.factors_and_indices)
+
+        def index_to_insensitive_representation(index):
+            index_type, index_no = index
+            if index_type == 'out':
+                return index
+            elif index_type == 'sum':
+                return ('sum', sum_index_to_axes[index])
+
+        factors_and_insensitive_indices = Counter(
+            (factor, tuple(index_to_insensitive_representation(i) for i in indices))
+            for factor, indices in self.factors_and_indices
+        )
+        return hash(frozenset(factors_and_insensitive_indices.items()))
 
 
 def submultisets_of_size(A, n):
@@ -555,12 +663,12 @@ def find_bijection(A, B, match=lambda a, b: a == b):
 def find_bijections(A, B, match=lambda a, b: a == b):
     A = Counter(A)
     B = Counter(B)
-    A_size = sum(A.values())
-    B_size = sum(B.values())
+    A_size = _builtin_sum(A.values())
+    B_size = _builtin_sum(B.values())
     if A_size != B_size:
         return []
     else:
-        return find_injection(A, B, match)
+        return find_injections(A, B, match)
 
 
 def find_injections(A, B, match=lambda a, b: a == b):
@@ -642,6 +750,9 @@ def outer(X, Y):
     X_indices = [('out', i) for i in range(X.ndim)]
     Y_indices = [('out', i) for i in range(X.ndim, X.ndim + Y.ndim)]
     return einsum([(X, X_indices), (Y, Y_indices)], X.ndim + Y.ndim)
+
+
+_builtin_sum = sum
 
 
 def sum(X, axis=None):
