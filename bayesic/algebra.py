@@ -9,7 +9,7 @@ import theano
 import theano.tensor as T
 
 import itertools as it
-from collections import Counter
+from collections import Counter, defaultdict
 
 class Expression(object):
     def __init__(self, parents):
@@ -402,19 +402,128 @@ class einsum(Expression):
         except StopIteration:
             raise ValueError("template must contain slot as a factor")
 
+        template_index_to_slot_axis = {}
+        for axis, index in enumerate(slot_indices):
+            if index in template_index_to_slot_axis:
+                # Note we could support this using diag
+                # expressions, but it's not a very useful thing to
+                # match and also makes life more fiddly, so not
+                # bothering for now.
+                raise ValueError("Same index used on multiple slot axes is not currently supported")
+            template_index_to_slot_axis[index] = axis
+
+        self_factors_and_indices = Counter(self.factors_and_indices)
         nonslots = [fi for fi in template.factors_and_indices if factor is not slot]
-        # Each nonslot factor in the template might occur multiple
-        # times in self. We might need to try different combinations
-        # of matches to find one where the indices line up:
-        per_factor_match_candidates = [
-            [f for f, _ in self.factors_and_indices if f == factor]
-            for factor, _ in nonslots
-        ]
-        # We consider the full cartesian product of all these matches.
-        # (TODO we could probably filter them a bit more earlier, but
-        # it's expected to be fairly rare to have that many factors
-        # here)
-        match_candidates = it.product(*per_factor_match_candidates)
+        factor_injections = find_injections(nonslots, self_factors_and_indices,
+                                            match=lambda a, b: a[0] == b[0])
+        for factor_injection in factor_injections:
+            remaining_factors_and_indices = self_factors_and_indices - Counter(
+                {fi: c for (_, fi), c in factor_injection.items()})
+
+            factors, template_indices, self_indices = zip(*(
+                (factor, template_indices_for_factor, self_indices_for_factor)
+                for (factor, template_indices_for_factor),
+                    (factor, self_indices_for_factor) in factor_injection.elements())
+            )
+
+            def factor_axes_for_indices(indices_for_factors):
+                index_to_axes = defaultdict(set)
+                for factor_no, indices in enumerate(indices_for_factors):
+                    for axis_no, index in enumerate(indices):
+                        index_to_axes[index].add((factor_no, axis_no))
+                return [(index, frozenset(axes)) for index, axes in index_to_axes.items()]
+
+            template_indices_and_axes = factor_axes_for_indices(template_indices)
+            self_indices_and_axes = factor_axes_for_indices(self_indices)
+
+            def index_match(template_index_and_axes, self_index_and_axes):
+                (template_index_type, template_index_no), template_axes \
+                    = template_index_and_axes
+                (self_index_type, self_index_no), self_axes = self_index_and_axes
+
+                return (
+                    # must occur in the same positions (axes of factors):
+                    template_axes == self_axes and
+                    # must be of same type (sum or out)
+                    template_index_type == self_index_type and
+                    # number must match for output index
+                    (template_index_no == self_index_no if template_index_type == 'out' else True)
+                )
+
+            index_bijection = find_bijection(template_indices_and_axes, self_indices_and_axes,
+                                             match=index_match)
+            if index_bijection is not None:
+                # We found a valid match of the non-slot factors of
+                # the template, and their indices. Now we just need to
+                # translate the remaining terms into something
+                # subtitutable for the slot.
+                to_template_index = {
+                    self_index: template_index
+                    for (template_index, _), (self_index, _) in index_bijection.elements()
+                }
+
+                def to_result_index(self_index):
+                    index_type, index_no = self_index
+                    if index_type == 'sum':
+                        if self_index in to_template_index:
+                            # A sum index which bridges the slot with
+                            # the other non-slot factors whose indices
+                            # we have mapped to template indices.
+
+                            # Because of this, we can look at the
+                            # template to find which axis of the slot
+                            # we need to output to, to get this sum
+                            # index.
+                            template_index = to_template_index[self_index]
+                            slot_axis = template_index_to_slot_axis.get(template_index)
+                            # The index might not be used in the slot
+                            # at all -- in which case we can't output
+                            # to it / can't fit this remaining term in
+                            # the slot:
+                            if slot_axis is None: return
+                            # Otherwise we're good, we can output to
+                            # the slot axis which corresponds to this
+                            # sum index:
+                            return ('out', slot_axis)
+
+                        else:
+                            # this is a sum index which occurs only in
+                            # the remaining terms, not in the (matches
+                            # for the) non-slot factors. We re-use the
+                            # same sum index number as a sum index in
+                            # our result. (Re-using ensures the
+                            # original ordering of sum indices is
+                            # preserved)
+                            return self_index
+
+                    else:
+                        # the index bijection preserves output
+                        # indices, so we don't need to do a lookup for
+                        # these. Also some output indices might exist
+                        # only in the remaining factors but not the
+                        # matches for the nonslots, so won't be in
+                        # this bijection.
+                        template_index = self_index
+                        slot_axis = template_index_to_slot_axis.get(template_index)
+                        # The output index might not be used in the
+                        # slot at all -- in which case we can't output
+                        # to it / can't fit this remaining term in the
+                        # slot:
+                        if slot_axis is None: return
+                        # Otherwise we're good, we can output to
+                        # the slot axis which corresponds to this
+                        # (outer) output index:
+                        return ('out', slot_axis)
+
+                result_factors_and_indices = [
+                    (factor, [to_result_index(i) for i in indices])
+                    for factor, indices in remaining_factors_and_indices.elements()
+                ]
+                # If to_result_index returned None for any indices, we
+                # can't fit the remaining items in the slot, so give
+                # up on this match. Otherwise, we're done!
+                if not any(i is None for _, indices in result_factor_and_indices for i in indices):
+                    return einsum(result_factors_and_indices, ndim=slot.ndim)
 
 
 def submultisets_of_size(A, n):
@@ -437,6 +546,21 @@ def submultisets_of_size(A, n):
         a_s = Counter({a: count_to_include})
         for S in submultisets_of_size(A_remaining, n - count_to_include):
             yield a_s + S
+
+
+def find_bijection(A, B, match=lambda a, b: a == b):
+    return next(iter(find_bijections(A, B, match)), None)
+
+
+def find_bijections(A, B, match=lambda a, b: a == b):
+    A = Counter(A)
+    B = Counter(B)
+    A_size = sum(A.values())
+    B_size = sum(B.values())
+    if A_size != B_size:
+        return []
+    else:
+        return find_injection(A, B, match)
 
 
 def find_injections(A, B, match=lambda a, b: a == b):
