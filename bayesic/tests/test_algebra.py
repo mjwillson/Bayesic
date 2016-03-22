@@ -30,6 +30,9 @@ y_ = randn(5)
 T = var('T', 3)
 T_ = randn(3, 5, 7)
 
+# int scalar
+a = var('a', 0, 'int32')
+
 
 def test_add():
     fn = (X + Y).compile()
@@ -154,7 +157,20 @@ def test_sum():
     npt.assert_allclose(fn(T=T_), T_.sum(axis=(0, 2)), rtol=1e-5)
 
 
-# Test combining of einsums:
+def test_shape_and_size():
+    fn = X.shape[0].compile()
+    assert fn(X=[[1,2],[3,4],[5,6]]) == 3
+    fn = X.shape[1].compile()
+    assert fn(X=[[1,2],[3,4],[5,6]]) == 2
+    fn = X.size.compile()
+    assert fn(X=[[1,2],[3,4],[5,6]]) == 6
+
+
+def test_eye():
+    fn = eye(a).compile()
+    npt.assert_equal(fn(a=2), np.eye(2))
+    npt.assert_equal(fn(a=5), np.eye(5))
+
 
 def test_composition_of_einsums_collapses_to_single_einsum():
     expr = dot(diagonal(dot(X, outer(x, y))), Y)
@@ -257,10 +273,6 @@ def test_find_injections_with_nonequality_match(A, B, *injections):
 
 
 def test_equality_of_expressions():
-    # Equality of expressions knows about some simple algebraic
-    # equivalences, and is relatively smart for einsums, but don't
-    # count on it doing any other more complicated algebraic
-    # simplifications in order to prove equivalence.
     assert X == X
     assert X != Y
     assert constant(1) == constant(1)
@@ -281,16 +293,29 @@ def test_equality_of_expressions():
     assert X * X.T != X * X
     assert X * X.T == X.T * X
 
-    assert dot(X, Y) == dot(Y.T, X.T).T
+    assert dot(X, Y).T == dot(Y.T, X.T)
+    assert dot(X, Y) != dot(Y, X)
 
     assert sum(X * X.T) == sum(X.T * X)
     assert sum(X * X.T) != trace(X) * trace(X)
 
     assert trace(dot(X, Y.T)) == sum(Y * X)
+    assert dot(dot(X, Y), Z) == dot(X, dot(Y, Z))
 
 
 def test_match():
     # slightly circular as match is used in einsum.__eq__
+
+    # eye insertion to achieve match:
+    assert (X * Y).match(dot(X*Y, Z), Z) == eye(X.shape[1])
+    assert X.match(dot(X, Z), Z) == eye(X.shape[1])
+
+    assert (X * y.dimshuffle('x', 0)).match(dot(X, Z), Z) \
+        == eye(X.shape[1]) * y.dimshuffle(0, 'x')
+    # TODO: it doesn't know that
+    # eye() * x.dimshuffle(0, 'x') == eye() * x.dimshuffle('x', 0)
+    # (both == diag(x))
+
     assert (X * Y).match(X * Z, Z) == Y
     assert (X * X).match(X * Z, Z) == X
     assert (X * X).match(Y * Z, Z) is None
@@ -298,10 +323,22 @@ def test_match():
     assert sum(Y * X).match(sum(X * Z), Z) == Y
     assert dot(X, Y).match(dot(X, Z), Z) == Y
 
+    assert dot(X, X).match(dot(X, Z), Z) == X
+    assert dot(X, X.T).match(dot(X, Z), Z) == X.T
+    assert dot(X, X.T).match(dot(X.T, Z), Z) is None
+
+    assert dot(X, X*X).match(dot(X, Z), Z) == X*X
+    assert dot(X, X*X).match(dot(Z, X*X), Z) == X
+    assert dot(X, X*X).match(dot(X*X, Z), Z) is None
+    assert dot(X, X*X).match(dot(X, X*Z), Z) == X
+
+    assert trace(dot(X, X)).match(sum(X*Z), Z) == X.T
+
     assert dot(X, Y).T.match(dot(X, Z), Z) is None
     assert dot(X, Y).T.match(dot(X.T, Z), Z) is None
     assert dot(X, Y).T.match(dot(Z, X.T), Z) == Y.T
 
     assert dot(X, dot(Y, X)).match(dot(X, Z), Z) == dot(Y, X)
 
+    assert X.match(Z, Z) == X
     assert (X * Y).match(Z, Z) == X*Y

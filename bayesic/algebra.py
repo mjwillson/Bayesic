@@ -57,10 +57,10 @@ class Expression(object):
         return "%s(%s)" % (type(self).__name__, ', '.join(repr(x) for x in self.parents))
 
     def bracketed_repr(self):
-        return '(%r)' % self
+        return repr(self)
 
     def terms(self):
-        """self must be equivalent to Sum(self.terms)"""
+        """self should be equivalent to sum(self.terms)"""
         return [self]
 
     def _equality_by(self):
@@ -72,6 +72,14 @@ class Expression(object):
         return self.parents
 
     def __eq__(self, other):
+        """Equality of expressions at (or slightly above) the syntax level.
+
+        It does knows about some simple algebraic equivalences, and is
+        relatively smart for einsums, but don't count on it doing any
+        other more complicated algebraic simplifications in order to
+        prove equivalence.
+
+        """
         return isinstance(other, self.__class__) \
             and self._equality_by() == other._equality_by()
 
@@ -80,6 +88,17 @@ class Expression(object):
 
     def __hash__(self):
         return hash(self._equality_by())
+
+    @property
+    def shape(self):
+        return tuple(shape(self, n) for n in range(self.ndim))
+
+    @property
+    def size(self):
+        return mul(*self.shape)
+
+    def match(self, template, slot):
+        return einsum._identity(self).match(template, slot)
 
 
 class var(Expression):
@@ -99,8 +118,6 @@ class var(Expression):
     def __repr__(self):
         return self.name
 
-    bracketed_repr = __repr__
-
     def _equality_by(self):
         return self.name
 
@@ -119,11 +136,25 @@ class constant(Expression):
     def __repr__(self):
         return repr(self.value)
 
-    bracketed_repr = __repr__
-
     def _equality_by(self):
         return self.value
 
+
+class shape(Expression):
+    ndim = 0
+
+    def __init__(self, expression, axis):
+        super().__init__([expression])
+        self.axis = axis
+
+    def _apply_to_parents(self, expression):
+        return expression.shape[self.axis]
+
+    def _equality_by(self):
+        return (self.parents[0], self.axis)
+
+    def __repr__(self):
+        return "%s.shape[%d]" % (self.parents[0].bracketed_repr(), self.axis)
 
 
 def wrap_if_literal(x):
@@ -190,9 +221,70 @@ class add(elemwise):
     def __repr__(self):
         return ' + '.join(repr(x) for x in self.parents)
 
+    def bracketed_repr(self):
+        return '(%r)' % self
+
     def _equality_by(self):
         """Making this a set means equality knows about commutativity of addition"""
         return frozenset(self.parents)
+
+
+class eye(Expression):
+    """A square identity matrix"""
+
+    ndim = 2
+
+    @with_wrapped_literals
+    def __init__(self, *shapes):
+        """shapes should be one or more symbolic or literal scalars, all
+        guaranteed to be equal at runtime.
+
+        (Why bother allowing redundant equal copies of the same
+        argument? Because we may not know statically which shapes are
+        equal, except by dint of them occurring together here; knowing
+        all the static shapes equal to ours helps us test equality
+        statically with other eye expressions.)
+
+        """
+        if len(shapes) == 0:
+            raise ValueError("need at least one shape for eye")
+        super().__init__(shapes)
+
+    def _apply_to_parents(self, shape, *_):
+        return T.eye(shape)
+
+    def __eq__(self, other):
+        """Any two eye expressions whose respective set of shape expressions
+        overlap, are considered equal.
+
+        This isn't technically an equivalence relation, really we want
+        its transitive closure, but we don't have the global
+        information to get that. Some kind of clever type inference
+        with shape type parameters and shape equality constraints
+        could do better, but this is Python not Haskell :)
+
+        Alternatively we could:
+
+        * make all eye's equal without regard for shape, and require
+        that you don't try to compare things unless you know their
+        shape to be equal.
+
+        * make equality a syntax level thing depending on the
+          potentially arbitrary choice of which single symbolic shape
+          to pass to it.
+
+        """
+        return isinstance(other, self.__class__) and \
+            len(set(self.parents) & set(other.parents)) > 0
+
+    def __hash__(self):
+        """To be compatible with __eq__ this has to be a not-very-unique hash.
+        Still I wouldn't expect loads of these in the same dict/set,
+        so should be ok.
+
+        """
+        return hash(self.__class__)
+
 
 
 def find_duplicate(values):
@@ -239,6 +331,16 @@ class einsum(Expression):
                all(index == ('out', j) for index, j in zip(indices, range(factor.ndim))):
                 return factor
         return super(einsum, cls).__new__(cls)
+
+    @classmethod
+    def _new(cls, factors_and_indices, ndim=None):
+        result = super(einsum, cls).__new__(cls)
+        result.__init__(factors_and_indices, ndim)
+        return result
+
+    @classmethod
+    def _identity(cls, expr):
+        return cls._new([(expr, [('out', i) for i in range(expr.ndim)])], expr.ndim)
 
     def __init__(self, factors_and_indices, ndim=None):
         """`factors_and_indices` -- pairs of (factor, indices)
@@ -393,9 +495,6 @@ class einsum(Expression):
         sum_axes_in_output = list(range(self.ndim, self.ndim + self.sums))
         return T.mul(*aligned_vars).sum(axis=sum_axes_in_output)
 
-    def as_einsum(self):
-        return self
-
     def __repr__(self):
         def letter_for_index(type, num):
             if type == 'out':
@@ -460,7 +559,8 @@ class einsum(Expression):
         """
         # special-case this -- the only case we need to support where
         # template isn't itself an einsum:
-        if template is slot: return self
+        if not isinstance(template, einsum):
+            template = einsum._identity(template)
 
         try:
             slot_indices = next(
@@ -486,30 +586,46 @@ class einsum(Expression):
             remaining_factors_and_indices = self_factors_and_indices - Counter(
                 {fi: c for (_, fi), c in factor_injection.items()})
 
-            factors, template_indices, self_indices = zip(*(
-                (factor, template_indices_for_factor, self_indices_for_factor)
-                for (factor, template_indices_for_factor),
-                    (factor, self_indices_for_factor) in factor_injection.elements())
-            )
+            if len(factor_injection) == 0:
+                factors, template_indices, self_indices = [], [], []
+            else:
+                factors, template_indices, self_indices = zip(*(
+                    (factor, template_indices_for_factor, self_indices_for_factor)
+                    for (factor, template_indices_for_factor),
+                        (factor, self_indices_for_factor) in factor_injection.elements())
+                )
 
             template_indices_and_axes = self._factor_axes_for_indices(template_indices).items()
             self_indices_and_axes = self._factor_axes_for_indices(self_indices).items()
 
-            def index_match(template_index_and_axes, self_index_and_axes):
+            def index_match(self_index_and_axes, template_index_and_axes):
                 (template_index_type, template_index_no), template_axes \
                     = template_index_and_axes
                 (self_index_type, self_index_no), self_axes = self_index_and_axes
 
-                return (
-                    # must occur in the same positions (axes of factors):
-                    template_axes == self_axes and
-                    # must be of same type (sum or out)
-                    template_index_type == self_index_type and
-                    # number must match for output index
-                    (template_index_no == self_index_no if template_index_type == 'out' else True)
-                )
+                # must occur in the same positions (axes of factors):
+                if template_axes != self_axes: return False
+                if self_index_type == 'sum':
+                    # sum index must map to sum index (but the index
+                    # number doesn't have to be the same)
+                    return template_index_type == 'sum'
+                elif self_index_type == 'out':
+                    # out index can map to a sum index or an out
+                    # index, but if it's an out index then the output
+                    # number must match.
+                    #
+                    # Where an out index maps to a sum index in the
+                    # template, to obtain a match we can turn the out
+                    # index into a sum index by adding an extra
+                    # delta_ij (identity matrix) factor and summing
+                    # over it, where i is the sum index and j is the
+                    # output index in question. See later for this.
+                    return (
+                        template_index_type != 'out' or
+                        template_index_no == self_index_no
+                    )
 
-            index_bijection = find_bijection(template_indices_and_axes, self_indices_and_axes,
+            index_bijection = find_bijection(self_indices_and_axes, template_indices_and_axes,
                                              match=index_match)
             if index_bijection is not None:
                 # We found a valid match of the non-slot factors of
@@ -518,9 +634,8 @@ class einsum(Expression):
                 # subtitutable for the slot.
                 to_template_index = {
                     self_index: template_index
-                    for (template_index, _), (self_index, _) in index_bijection.elements()
+                    for (self_index, _), (template_index, _) in index_bijection.elements()
                 }
-
                 def to_result_index(self_index):
                     index_type, index_no = self_index
                     if index_type == 'sum':
@@ -555,29 +670,57 @@ class einsum(Expression):
                             # preserved)
                             return self_index
 
-                    else:
-                        # the index bijection preserves output
-                        # indices, so we don't need to do a lookup for
-                        # these. Also some output indices might exist
-                        # only in the remaining factors but not the
-                        # matches for the nonslots, so won't be in
-                        # this bijection.
-                        template_index = self_index
+                    elif index_type == 'out':
+                        # Some output indices might exist only in the
+                        # remaining factors but not the matches for
+                        # the nonslots, so won't be in this bijection,
+                        # these we just let map to the same output
+                        # index.
+                        #
+                        # Others will map either to the same out
+                        # index, or a sum index in the template:
+                        template_index = to_template_index.get(self_index, self_index)
                         slot_axis = template_index_to_slot_axis.get(template_index)
-                        # The output index might not be used in the
-                        # slot at all -- in which case we can't output
-                        # to it / can't fit this remaining term in the
-                        # slot:
                         if slot_axis is None: return
-                        # Otherwise we're good, we can output to
-                        # the slot axis which corresponds to this
-                        # (outer) output index:
                         return ('out', slot_axis)
 
                 result_factors_and_indices = [
                     (factor, [to_result_index(i) for i in indices])
                     for factor, indices in remaining_factors_and_indices.elements()
                 ]
+                for (self_index, axes), (template_index, _) in index_bijection.elements():
+                    if self_index[0] == 'out' and template_index[0] == 'sum':
+                        # we need to convert this output index into a
+                        # sum index by adding a delta_ij / identity
+                        # matrix factor making the two indices equal
+                        # (and summing over the sum index)
+
+                        # Find which indices in the slot the sum
+                        # index, and the output index (which should be
+                        # equivalent to it) map to, if any:
+                        sum_index_as_slot_axis = template_index_to_slot_axis.get(template_index)
+                        out_index_as_slot_axis = template_index_to_slot_axis.get(self_index)
+                        sum_index_as_result_index = ('out', sum_index_as_slot_axis) \
+                                                     if sum_index_as_slot_axis is not None else None
+                        out_index_as_result_index = ('out', out_index_as_slot_axis) \
+                                                     if out_index_as_slot_axis is not None else None
+                        # we sort them so that if the desired output
+                        # slot eye is symmetric so it doesn't matter
+                        # which way round the indices go, but einsum
+                        # doesn't know this, so we sort the two
+                        # indices -- if they're in order (and without
+                        # gaps) einsum will just pass through the eye
+                        # matrix without needing to wrap it.
+                        eye_result_indices = sorted(
+                            [sum_index_as_result_index, out_index_as_result_index])
+                        # Get its shape from all the factor axes it
+                        # occurs in:
+                        matching_shapes = [
+                            factors[factor_no].shape[axis_no] for factor_no, axis_no in axes]
+                        # Add the eye factor forcing the two indices equal
+                        result_factors_and_indices.append(
+                            (eye(*matching_shapes), eye_result_indices))
+
                 # If to_result_index returned None for any indices, we
                 # can't fit the remaining items in the slot, so give
                 # up on this match. Otherwise, we're done!
@@ -594,6 +737,10 @@ class einsum(Expression):
         X_ji == sum_ij X_ji X_ij.
 
         """
+        # shortcut for a common case, as this is otherwise
+        # expensive-ish for an equality test:
+        if self is other: return True
+        if not isinstance(other, self.__class__): return False
         slot = var('__slot__', ndim=0)
         match = self.match(other * slot, slot)
         return match is not None and len(match.factors_and_indices) == 0
@@ -669,6 +816,10 @@ def find_bijections(A, B, match=lambda a, b: a == b):
         return []
     else:
         return find_injections(A, B, match)
+
+
+def find_injection(A, B, match=lambda a, b: a == b):
+    return next(iter(find_injections(A, B, match)), None)
 
 
 def find_injections(A, B, match=lambda a, b: a == b):
