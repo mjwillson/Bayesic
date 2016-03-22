@@ -299,6 +299,12 @@ def find_duplicate(values):
             return i, seen[v], v
         seen[v] = i
 
+def equivalence_classes(equal_pairs):
+    classes = {}
+    for a, b in equal_pairs:
+        class_ = classes.get(a, frozenset([a])) | classes.get(b, frozenset([b]))
+        for x in class_: classes[x] = class_
+    return frozenset(classes.values())
 
 class einsum(Expression):
     """This is a general form for various kinds of products between
@@ -436,6 +442,44 @@ class einsum(Expression):
                         # index to map it to.
                         factor_in_self.append(map_idx(parent, ('sum', i)))
                 self.factors_and_indices.append((factor, tuple(factor_in_self)))
+
+        # Remove eye / identity-matrix / delta factors, when one of
+        # their indices is summed over.
+        equal_index_pairs = [(('sum', i), ('sum', i)) for i in range(self.sums)]
+        def filter_eye_with_sum_index(factor, indices):
+            if isinstance(factor, eye) and (indices[0][0] == 'sum' or indices[1][0] == 'sum'):
+                equal_index_pairs.append(indices)
+                return False
+            return True
+
+        self.factors_and_indices = [
+            fi for fi in self.factors_and_indices if filter_eye_with_sum_index(*fi)]
+
+        eye_index_mapping = {}
+        for class_ in equivalence_classes(equal_index_pairs):
+            # this will pick an output index if present, otherwise the
+            # lowest sum index. ('out' < 'sum' -- convenient)
+            representative = min(class_)
+            for index in class_: eye_index_mapping[index] = representative
+
+        # Now renumber to fill gaps
+        sum_nos = sorted(
+            index_no for type_, index_no in eye_index_mapping.values()
+            if type_ == 'sum')
+
+        renumber_mapping = {('sum', no): ('sum', i) for i, no in enumerate(sum_nos)}
+
+        self.sums = len(sum_nos)
+
+        def collapse_eye_indices(factor, indices):
+            def collapse_index(i):
+                i = eye_index_mapping.get(i, i)
+                return renumber_mapping.get(i, i)
+            return factor, tuple(collapse_index(i) for i in indices)
+
+        self.factors_and_indices = [
+            collapse_eye_indices(*fi) for fi in self.factors_and_indices]
+
 
         super(einsum, self).__init__([f for f, _ in self.factors_and_indices])
 

@@ -342,3 +342,7 @@ def test_match():
 
     assert X.match(Z, Z) == X
     assert (X * Y).match(Z, Z) == X*Y
+
+
+def test_identity_elimination():
+    assert dot(X, eye(X.shape[1])) == X
