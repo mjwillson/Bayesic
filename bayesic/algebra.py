@@ -97,9 +97,6 @@ class Expression(object):
     def size(self):
         return mul(*self.shape)
 
-    def match(self, template, slot):
-        return einsum._identity(self).match(template, slot)
-
 
 class var(Expression):
     def __init__(self, name, ndim, dtype='float32'):
@@ -306,71 +303,55 @@ def equivalence_classes(equal_pairs):
         for x in class_: classes[x] = class_
     return frozenset(classes.values())
 
-class einsum(Expression):
+
+def einsum(factors_and_indices, ndim=None):
     """This is a general form for various kinds of products between
     tensors, and other multilinear functions of tensors, similar to
     numpy.einsum.
 
-    It can implement:
+    It can implement dot, tensor_dot, batched_dot, outer, transpose /
+    dimshuffle, diagonal, trace, sum along some axes, elemwise
+    product, and various things inbetween.
 
-    dot, tensor_dot, batched_dot, outer, transpose / dimshuffle,
-    diagonal, trace, sum along some axes, elemwise product, and
-    various things inbetween.
+    Params:
+
+    `factors_and_indices` -- pairs of (factor, indices) where indices
+    is a tuple containing an index for each axis of the factor.
+
+    Indices are either ('sum', n) or ('out', n).
+
+    A sum index will be summed over; an out index corresponds to
+    an axis of the output tensor. E.g. let s0, s1 be sum
+    indices, and o0, o1, o2 output indices. Then
+
+    einsum([(X, (o2, s0, o1), (Y, (s0, s1, o0, o1)])
+
+    corresponds to a tensor T whose entries are:
+
+    T_{o0, o1, o2} = sum_{s0, s1} X_{o2, s0, o1} Y_{s0, s1, o0, o1}
+
+    `ndim` is the number of 'out' indices. If not specified it'll be
+    set to max output index + 1. Note that not every output index in
+    range(0, ndim) needs to occur -- if an output index doesn't occur,
+    it'll correspond to a broadcastable axis in the output tensor (see
+    docs on theano broadcasting)
+
     """
+    return Einsum(factors_and_indices, ndim)._canonicalize()
 
-    def __new__(cls, factors_and_indices, ndim=None):
-        """Create an einsum, unless we have:
 
-        (a) an expression which is equivalent to the identity function
-        (a single factor whose indices are all outputs in the same
-        order), in which case just return that factor.
-
-        (b) an empty einsum, which is equivalent to a constant tensor
-        of 1's.
-
-        See einsum.__init__ for details on the constructor args.
-
-        """
-        if len(factors_and_indices) == 1:
-            factor, indices = factors_and_indices[0]
-            if (ndim is None or ndim == factor.ndim) and \
-               all(index == ('out', j) for index, j in zip(indices, range(factor.ndim))):
-                return factor
-        return super(einsum, cls).__new__(cls)
+class Einsum(Expression):
+    """See docs on `einsum`"""
 
     @classmethod
-    def _new(cls, factors_and_indices, ndim=None):
-        result = super(einsum, cls).__new__(cls)
-        result.__init__(factors_and_indices, ndim)
-        return result
-
-    @classmethod
-    def _identity(cls, expr):
-        return cls._new([(expr, [('out', i) for i in range(expr.ndim)])], expr.ndim)
+    def _wrap_if_not_einsum(cls, expr):
+        """Wraps with an identity-equivalent Einsum if not one already."""
+        if isinstance(expr, cls):
+            return expr
+        else:
+            return cls([(expr, tuple(('out', i) for i in range(expr.ndim)))], expr.ndim)
 
     def __init__(self, factors_and_indices, ndim=None):
-        """`factors_and_indices` -- pairs of (factor, indices)
-        where indices contains an index for each axis of the factor.
-
-        Indices are either ('sum', n) or ('out', n).
-
-        A sum index will be summed over; an out index corresponds to
-        an axis of the output tensor. E.g. let s0, s1 be sum
-        indices, and o0, o1, o2 output indices. Then
-
-        einsum([(X, (o2, s0, o1), (Y, (s0, s1, o0, o1)])
-
-        corresponds to a tensor T whose entries are:
-
-        T_{o0, o1, o2} = sum_{s0, s1} X_{o2, s0, o1} Y_{s0, s1, o0, o1}
-
-        `ndim` is the number of 'out' indices. If not specified it'll
-        be set to max index + 1. Note that not every output index in
-        range(0, ndim) needs to occur -- if an output index doesn't
-        occur, it'll correspond to a broadcastable axis in the output
-        tensor (see docs on theano broadcasting)
-
-        """
         if not all(f.ndim == len(indices) for f, indices in factors_and_indices):
             raise ValueError("The indices for each factor must have same length as factor.ndim")
 
@@ -383,37 +364,64 @@ class einsum(Expression):
             ndim = max(output_nums) + 1
         if not all(num >= 0 and num < ndim for num in output_nums):
             raise ValueError("some output indices are out of range")
-        self.ndim = ndim
 
-        # If the factors are themselves einsums, we swallow them up,
-        # incorporating their factors into ours. This means first
-        # building a mapping of the sum indices from all the separate
-        # einsum factors, as well as our own sum indices, into a
-        # single combined namespace / range:
+        self.ndim = ndim
+        self.factors_and_indices = tuple(factors_and_indices)
+        super(Einsum, self).__init__([f for f, _ in factors_and_indices])
+
+    @property
+    def out_indices(self):
+        return [('out', i) for i in range(self.ndim)]
+
+    @property
+    def sum_indices(self):
+        return sorted(set(
+            i for factor, indices in self.factors_and_indices
+            for i in indices
+            if i[0] == 'sum'
+        ))
+
+    def _canonicalize(self):
+        """This is done automatically by einsum.__new__"""
+        return self \
+            ._incorporate_child_einsum_factors() \
+            ._collapse_eye_factors() \
+            ._passthrough_if_identity()
+
+    def _incorporate_child_einsum_factors(self):
+        """If the factors are themselves einsums, we swallow them up,
+        incorporating their factors into ours. This means first
+        building a mapping of the sum indices from all the separate
+        einsum factors, as well as our own sum indices, into a single
+        combined namespace / range.
+
+        """
         sums = 0
         index_mapping = {}
-        for factor, indices in factors_and_indices:
-            if isinstance(factor, einsum):
-                for i in range(factor.sums):
-                    index_mapping[(factor, ('sum', i))] = ('sum', sums)
+        for factor, indices in self.factors_and_indices:
+            if isinstance(factor, Einsum):
+                for sum_index in factor.sum_indices:
+                    index_mapping[(factor, sum_index)] = ('sum', sums)
                     sums += 1
 
-        for factors, indices in factors_and_indices:
-            for type_, i in indices:
-                if type_ == 'sum' and (None, ('sum', i)) not in index_mapping:
-                    index_mapping[(None, ('sum', i))] = ('sum', sums)
+        for factors, indices in self.factors_and_indices:
+            for index in indices:
+                if index[0] == 'sum' and index not in index_mapping:
+                    index_mapping[index] = ('sum', sums)
                     sums += 1
 
-        self.sums = sums
-        def map_idx(parent, i):
+        def map_idx(index, parent=None):
             # sum indices will get mapped; out indices passed through.
-            return index_mapping.get((parent, i), i)
+            return index_mapping.get(
+                (parent, index) if parent is not None else index,
+                index
+            )
 
         # Now we can map the factors of each parent einsum factor, up
         # to a factor of ourself.
-        self.factors_and_indices = []
-        for parent, parent_in_self in factors_and_indices:
-            if isinstance(parent, einsum):
+        result_factors_and_indices = []
+        for parent, parent_in_self in self.factors_and_indices:
+            if isinstance(parent, Einsum):
                 parent_factors_and_indices = parent.factors_and_indices
             else:
                 # Treat parent as an identity einsum if it's not
@@ -435,17 +443,22 @@ class einsum(Expression):
                         # einsums beneath us. If it's an out index for
                         # the top-level expression then it gets left
                         # as such.
-                        factor_in_self.append(map_idx(None, parent_in_self[i]))
+                        factor_in_self.append(map_idx(parent_in_self[i]))
                     elif type_ == 'sum':
                         # sum index with respect to this particular
                         # parent einsum. We look up what top-level sum
                         # index to map it to.
-                        factor_in_self.append(map_idx(parent, ('sum', i)))
-                self.factors_and_indices.append((factor, tuple(factor_in_self)))
+                        factor_in_self.append(map_idx(('sum', i), parent))
+                result_factors_and_indices.append((factor, tuple(factor_in_self)))
 
-        # Remove eye / identity-matrix / delta factors, when one of
-        # their indices is summed over.
-        equal_index_pairs = [(('sum', i), ('sum', i)) for i in range(self.sums)]
+        return Einsum(result_factors_and_indices, self.ndim)
+
+    def _collapse_eye_factors(self):
+        """Remove eye / identity-matrix / delta factors, when one of their
+        indices is summed over.
+
+        """
+        equal_index_pairs = [(i, i) for i in self.sum_indices]
         def filter_eye_with_sum_index(factor, indices):
             if isinstance(factor, eye) and (indices[0][0] == 'sum' or indices[1][0] == 'sum'):
                 equal_index_pairs.append(indices)
@@ -469,19 +482,23 @@ class einsum(Expression):
 
         renumber_mapping = {('sum', no): ('sum', i) for i, no in enumerate(sum_nos)}
 
-        self.sums = len(sum_nos)
-
         def collapse_eye_indices(factor, indices):
             def collapse_index(i):
                 i = eye_index_mapping.get(i, i)
                 return renumber_mapping.get(i, i)
             return factor, tuple(collapse_index(i) for i in indices)
 
-        self.factors_and_indices = [
-            collapse_eye_indices(*fi) for fi in self.factors_and_indices]
+        result_factors_and_indices = tuple(
+            collapse_eye_indices(*fi) for fi in self.factors_and_indices)
+        return Einsum(result_factors_and_indices, self.ndim)
 
-
-        super(einsum, self).__init__([f for f, _ in self.factors_and_indices])
+    def _passthrough_if_identity(self):
+        if len(self.factors_and_indices) == 1:
+            factor, indices = self.factors_and_indices[0]
+            if (self.ndim == factor.ndim and
+                all(index == ('out', j) for index, j in zip(indices, range(factor.ndim)))):
+                return factor
+        return self
 
     @property
     def output_type(self):
@@ -529,14 +546,13 @@ class einsum(Expression):
                 return 'x'
 
         def shuffle_to_axes(factor_indices):
-            return [axis_of(('out', num), factor_indices) for num in range(self.ndim)] + \
-                [axis_of(('sum', num), factor_indices) for num in range(self.sums)]
+            return [axis_of(i, factor_indices) for i in self.out_indices + self.sum_indices]
 
         aligned_vars = [
             var.dimshuffle(*shuffle_to_axes(factor_indices))
             for var, factor_indices in vars_and_indices
         ]
-        sum_axes_in_output = list(range(self.ndim, self.ndim + self.sums))
+        sum_axes_in_output = list(range(self.ndim, self.ndim + len(self.sum_indices)))
         return T.mul(*aligned_vars).sum(axis=sum_axes_in_output)
 
     def __repr__(self):
@@ -547,6 +563,7 @@ class einsum(Expression):
                 except IndexError:
                     return 'o%d' % num
             elif type == 'sum':
+                num = self.sum_indices.index((type, num))
                 try:
                     return 'ijklmn'[num]
                 except IndexError:
@@ -563,14 +580,14 @@ class einsum(Expression):
             indexed_factor_repr(factor, indices) for factor, indices in self.factors_and_indices) \
             or '1'
 
-        if self.sums > 0:
-            sum_letters = ''.join(letter_for_index('sum', n) for n in range(self.sums))
+        if self.sum_indices:
+            sum_letters = ''.join(letter_for_index(*i) for i in self.sum_indices)
             summed_product = 'sum_%s %s' % (sum_letters, product)
         else:
             summed_product = product
 
         if self.ndim > 0:
-            output_letters = ''.join(letter_for_index('out', n) for n in range(self.ndim))
+            output_letters = ''.join(letter_for_index(*i) for i in self.out_indices)
             return 'einsum(out_%s = %s)' % (output_letters, summed_product)
         else:
             return 'einsum(%s)' % summed_product
@@ -584,27 +601,7 @@ class einsum(Expression):
         return {index: frozenset(axes) for index, axes in index_to_axes.items()}
 
     def match(self, template, slot):
-        """Try to pattern-match this einsum expression against a template
-        einsum expression which contains a var `slot` as exactly one
-        of its factors.
-
-        Returns an einsum which, when substituted for `slot` in the
-        template, is equal to self -- if this is possible, otherwise
-        None.
-
-        This is a general way of pulling out some factor(s) out of an
-        einsum, and of testing if it has a particular factor(s),
-        noting that it's not just the identity of the factor that
-        matters, but the way it's multiplied/combined with other
-        factors (as specified by the way the `slot` is combined with
-        the other terms in the template). Useful for identifying and
-        collecting like terms in a sum.
-
-        """
-        # special-case this -- the only case we need to support where
-        # template isn't itself an einsum:
-        if not isinstance(template, einsum):
-            template = einsum._identity(template)
+        template = Einsum._wrap_if_not_einsum(template)
 
         try:
             slot_indices = next(
@@ -823,6 +820,35 @@ class einsum(Expression):
             for factor, indices in self.factors_and_indices
         )
         return hash(frozenset(factors_and_insensitive_indices.items()))
+
+
+def match(expression, template, slot):
+    """Try to pattern-match an expression against a template einsum
+    expression which contains a var `slot` as exactly one of its
+    factors.
+
+    Returns an expression which, when substituted for `slot` in the
+    template, is equal to self -- if this is possible, otherwise
+    None.
+
+    This is a general way of pulling out some factor(s) out of an
+    einsum, and of testing if it has a particular factor(s),
+    noting that it's not just the identity of the factor that
+    matters, but the way it's multiplied/combined with other
+    factors (as specified by the way the `slot` is combined with
+    the other terms in the template). Useful for identifying and
+    collecting like terms in a su
+
+    Note this can create identity (eye) factors to pull out, even if
+    they weren't present in the original expression, where this
+    enables a match. E.g. matching `A` against `dot(A, X)` works,
+    giving `X = eye(A.shape[1])`.
+
+    In future this may expand to pattern-match broader classes of
+    expression.
+
+    """
+    return Einsum._wrap_if_not_einsum(expression).match(template, slot)
 
 
 def submultisets_of_size(A, n):

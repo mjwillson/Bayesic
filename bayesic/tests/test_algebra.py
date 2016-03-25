@@ -220,7 +220,7 @@ def test_find_injections_one_possible_with_equality_matching(A, B, injection):
 
 
 # second char must match
-def match(a, b):
+def _match(a, b):
     return a[1] == b[1]
 
 
@@ -267,7 +267,7 @@ def match(a, b):
 def test_find_injections_with_nonequality_match(A, B, *injections):
     # We need to compare multisets of multisets, which is a bit fiddly as
     # Counter isn't hashable:
-    result = Counter(frozenset(c.items()) for c in find_injections(A, B, match))
+    result = Counter(frozenset(c.items()) for c in find_injections(A, B, _match))
     expected = Counter(frozenset(Counter(i).items()) for i in injections)
     assert result == expected
 
@@ -307,41 +307,41 @@ def test_match():
     # slightly circular as match is used in einsum.__eq__
 
     # eye insertion to achieve match:
-    assert (X * Y).match(dot(X*Y, Z), Z) == eye(X.shape[1])
-    assert X.match(dot(X, Z), Z) == eye(X.shape[1])
+    assert match(X * Y, dot(X*Y, Z), Z) == eye(X.shape[1])
+    assert match(X, dot(X, Z), Z) == eye(X.shape[1])
 
-    assert (X * y.dimshuffle('x', 0)).match(dot(X, Z), Z) \
+    assert match(X * y.dimshuffle('x', 0), dot(X, Z), Z) \
         == eye(X.shape[1]) * y.dimshuffle(0, 'x')
     # TODO: it doesn't know that
     # eye() * x.dimshuffle(0, 'x') == eye() * x.dimshuffle('x', 0)
     # (both == diag(x))
 
-    assert (X * Y).match(X * Z, Z) == Y
-    assert (X * X).match(X * Z, Z) == X
-    assert (X * X).match(Y * Z, Z) is None
-    assert (Y * X).match(X * Z, Z) == Y
-    assert sum(Y * X).match(sum(X * Z), Z) == Y
-    assert dot(X, Y).match(dot(X, Z), Z) == Y
+    assert match(X * Y, X * Z, Z) == Y
+    assert match(X * X, X * Z, Z) == X
+    assert match(X * X, Y * Z, Z) is None
+    assert match(Y * X, X * Z, Z) == Y
+    assert match(sum(Y * X), sum(X * Z), Z) == Y
+    assert match(dot(X, Y), dot(X, Z), Z) == Y
 
-    assert dot(X, X).match(dot(X, Z), Z) == X
-    assert dot(X, X.T).match(dot(X, Z), Z) == X.T
-    assert dot(X, X.T).match(dot(X.T, Z), Z) is None
+    assert match(dot(X, X), dot(X, Z), Z) == X
+    assert match(dot(X, X.T), dot(X, Z), Z) == X.T
+    assert match(dot(X, X.T), dot(X.T, Z), Z) is None
 
-    assert dot(X, X*X).match(dot(X, Z), Z) == X*X
-    assert dot(X, X*X).match(dot(Z, X*X), Z) == X
-    assert dot(X, X*X).match(dot(X*X, Z), Z) is None
-    assert dot(X, X*X).match(dot(X, X*Z), Z) == X
+    assert match(dot(X, X*X), dot(X, Z), Z) == X*X
+    assert match(dot(X, X*X), dot(Z, X*X), Z) == X
+    assert match(dot(X, X*X), dot(X*X, Z), Z) is None
+    assert match(dot(X, X*X), dot(X, X*Z), Z) == X
 
-    assert trace(dot(X, X)).match(sum(X*Z), Z) == X.T
+    assert match(trace(dot(X, X)), sum(X*Z), Z) == X.T
 
-    assert dot(X, Y).T.match(dot(X, Z), Z) is None
-    assert dot(X, Y).T.match(dot(X.T, Z), Z) is None
-    assert dot(X, Y).T.match(dot(Z, X.T), Z) == Y.T
+    assert match(dot(X, Y).T, dot(X, Z), Z) is None
+    assert match(dot(X, Y).T, dot(X.T, Z), Z) is None
+    assert match(dot(X, Y).T, dot(Z, X.T), Z) == Y.T
 
-    assert dot(X, dot(Y, X)).match(dot(X, Z), Z) == dot(Y, X)
+    assert match(dot(X, dot(Y, X)), dot(X, Z), Z) == dot(Y, X)
 
-    assert X.match(Z, Z) == X
-    assert (X * Y).match(Z, Z) == X*Y
+    assert match(X, Z, Z) == X
+    assert match(X * Y, Z, Z) == X*Y
 
 
 def test_identity_elimination():
