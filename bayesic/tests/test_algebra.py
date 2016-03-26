@@ -3,6 +3,9 @@ from ..algebra import *
 import numpy.testing as npt
 import numpy as np
 import numpy.random as npr
+import theano
+import theano.tensor as T
+from theano.printing import debugprint as Tprint
 
 from nose_parameterized import parameterized
 
@@ -27,8 +30,8 @@ x_ = randn(5)
 y_ = randn(5)
 
 # 3D tensor
-T = var('T', 3)
-T_ = randn(3, 5, 7)
+S = var('S', 3)
+S_ = randn(3, 5, 7)
 
 # int scalar
 a = var('a', 0, 'int32')
@@ -118,8 +121,8 @@ def test_transpose():
 
 
 def test_dimshuffle():
-    fn = dimshuffle(T, 2, 0, 1).compile()
-    npt.assert_allclose(fn(T=T_), np.transpose(T_, (2, 0, 1)))
+    fn = dimshuffle(S, 2, 0, 1).compile()
+    npt.assert_allclose(fn(S=S_), np.transpose(S_, (2, 0, 1)))
 
 
 def test_dimshuffle_broadcasting():
@@ -146,15 +149,15 @@ def test_outer():
 
 
 def test_sum():
-    fn = sum(T).compile()
-    npt.assert_allclose(fn(T=T_), T_.sum(), rtol=1e-5)
+    fn = sum(S).compile()
+    npt.assert_allclose(fn(S=S_), S_.sum(), rtol=1e-5)
 
-    fn = sum(T, axis=0).compile()
-    npt.assert_allclose(fn(T=T_), T_.sum(axis=0), rtol=1e-5)
+    fn = sum(S, axis=0).compile()
+    npt.assert_allclose(fn(S=S_), S_.sum(axis=0), rtol=1e-5)
 
     # Check works as a method too
-    fn = T.sum(axis=(0, 2)).compile()
-    npt.assert_allclose(fn(T=T_), T_.sum(axis=(0, 2)), rtol=1e-5)
+    fn = S.sum(axis=(0, 2)).compile()
+    npt.assert_allclose(fn(S=S_), S_.sum(axis=(0, 2)), rtol=1e-5)
 
 
 def test_shape_and_size():
@@ -346,3 +349,36 @@ def test_match():
 
 def test_identity_elimination():
     assert dot(X, eye(X.shape[1])) == X
+
+
+def theano_eq(A, B):
+    """Recursively compare two theano expressions. This is probably not
+    foolproof, but good enough for these tests
+
+    """
+    if A.owner is not None:
+        return (
+            B.owner is not None and
+            A.index == B.index and
+            A.owner.op == B.owner.op and
+            all(theano_eq(X, Y) for X, Y in zip(A.owner.inputs, B.owner.inputs))
+        )
+    else:
+        # constant, variable, ...?
+        return A == B
+
+def assert_theano_eq(A, B):
+    assert theano_eq(A, B), "theano expressions don't match:\n\n%s\n\n%s" \
+        % (Tprint(A, file='str'), Tprint(B, file='str'))
+
+
+def test_einsum_impl():
+    tin, texpr = (X*Y).sum(axis=1)._theano_inputs_and_expression()
+    assert_theano_eq((tin['X'] * tin['Y']).sum(axis=1), texpr)
+
+    tin, texpr = X.sum(axis=1)._theano_inputs_and_expression()
+    assert_theano_eq(tin['X'].sum(axis=1), texpr)
+
+
+    tin, texpr = dot(X, Y)._theano_inputs_and_expression()
+    assert_theano_eq(T.dot(tin['X'], tin['Y']), texpr)
