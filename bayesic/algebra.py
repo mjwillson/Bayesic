@@ -36,12 +36,16 @@ class Expression(object):
         parent_vars = [parent.apply(inputs) for parent in self.parents]
         return self._apply_to_parents(*parent_vars)
 
-    def compile(self):
+    def _theano_inputs_and_expression(self):
         input_vars = {
             name: T.TensorType(dtype, [False]*ndim)(name)
             for name, (dtype, ndim) in self.input_types.items()
         }
         expression = self.apply(input_vars)
+        return input_vars, expression
+
+    def compile(self):
+        input_vars, expression = self._theano_inputs_and_expression()
         inputs = list(input_vars.values())
         input_names = list(input_vars.keys())
         fn = theano.function(inputs, expression)
@@ -507,53 +511,94 @@ class Einsum(Expression):
     def factors(self):
         return self.parents
 
-    def _eliminate_duplicate_indices(self, var, indices):
-        while True:
-            dupe_info = find_duplicate(indices)
-            if dupe_info is None:
-                return var, indices
-            axis1, axis2, dupe = dupe_info
-            # Bug with T.diagonal when axes are 0, 1 but ndim > 2
-            var = T.Diagonal(0, axis1, axis2)(var)
-            indices = tuple([i for n, i in enumerate(indices) if n != axis1 and n != axis2] + [dupe])
+    def _rewrite_repeated_index_on_factor_as_diagonal(self):
+        def rewrite_factor(factor, indices):
+            while True:
+                dupe_info = find_duplicate(indices)
+                if dupe_info is None:
+                    return factor, indices
+                axis1, axis2, dupe = dupe_info
+                factor = _diagonal(factor, axis1, axis2)
+                indices = tuple([i for n, i in enumerate(indices)
+                                 if n != axis1 and n != axis2] + [dupe])
+        result_factors_and_indices = tuple(
+            rewrite_factor(f, i) for f, i in self.factors_and_indices)
+        return Einsum(result_factors_and_indices, self.ndim)
 
-    def _apply_to_parents(self, *factor_vars):
-        # First eliminate any duplicate indices into the same input
-        # tensor, via extracting diagonals. This will ensure each
-        # index appears at most once in each tensor, which will help
-        # later:
-        vars_and_indices = [
-            self._eliminate_duplicate_indices(var, indices)
-            for var, (factor, indices) in zip(factor_vars, self.factors_and_indices)
-        ]
+    def _rewrite_as_special_case_ops(self):
+        """So we've gone to all the length of unifying various kinds of einsum
+        based expressions, but to actually execute them we need to
+        convert them back to some combination of special-purpose ops:
+        diagonal, sum, mul and dimshuffle are technically sufficient,
+        although we also use tensordot (which generalises dot) where
+        possible to make things fast.
 
-        # Now a simple approach: dimshuffle all tensors so they line
-        # up, with one axis per (sum or output) index and so that they
-        # broadcast over any indices that don't appear. Then just
-        # multiply them, and then sum over the sum axes.
-        #
-        # This can be very slow, since it creates a big (potentially
-        # high-dimensional) intermediate result tensor.
-        #
-        # TODO: we can do better than this by spotting sums that are
-        # reducible to matrix-matrix, matrix-vector products. For now
-        # just worrying about the algebra though.
+        Special internal expression classes (_sum, _mul etc) are to
+        represent these special-purpose ops as a step along the way to
+        generating a theano expression.
 
+        Summations are done in the order specified -- this means that
+        the associativity/bracketing of a bunch of matrix products is
+        preserved, so you have control over this (it can affect
+        compute time). If we were doing this at runtime we could look
+        at the shapes of the factors and figure out the actual best
+        ordering of operations then, but without knowing the shapes,
+        some static heuristics together with preserving the requested
+        ordering of summations will have to do.
+
+        """
+        return self \
+            ._rewrite_repeated_index_on_factor_as_diagonal() \
+            ._rewrite_as_sum_of_mul()
+
+    def _rewrite_as_sum_of_mul(self):
+        """A naive approach to implementing an einsum: dimshuffle all tensors
+        so they line up, with one axis per (sum or output) index and
+        so that they broadcast over any indices that don't appear.
+        Then just multiply them, and then sum over the sum axes.
+
+        This can be very slow, since it creates a big (potentially
+        high-dimensional) intermediate result tensor.
+
+        There must be no repeated indices on any factor before calling
+        this (see _rewrite_repeated_index_on_factor_as_diagonal)
+
+        TODO: we can do better than this by spotting sums that are
+        reducible to matrix-matrix, matrix-vector products. For now
+        just worrying about the algebra though.
+
+        """
         def axis_of(index, indices):
             try:
                 return indices.index(index)
             except ValueError:
                 return 'x'
 
-        def shuffle_to_axes(factor_indices):
-            return [axis_of(i, factor_indices) for i in self.out_indices + self.sum_indices]
+        def dimshuffle_to_axes(factor, indices):
+            axes = [axis_of(i, indices) for i in self.out_indices + self.sum_indices]
+            if axes == list(range(factor.ndim)):
+                return factor
+            else:
+                return _dimshuffle(factor, *axes)
 
-        aligned_vars = [
-            var.dimshuffle(*shuffle_to_axes(factor_indices))
-            for var, factor_indices in vars_and_indices
+        aligned_factors = [
+            dimshuffle_to_axes(factor, indices)
+            for factor, indices in self.factors_and_indices
         ]
         sum_axes_in_output = list(range(self.ndim, self.ndim + len(self.sum_indices)))
-        return T.mul(*aligned_vars).sum(axis=sum_axes_in_output)
+        if len(aligned_factors) == 0:
+            mul_result = dimshuffle(constant(1), *(['x'] * self.ndim))
+        elif len(aligned_factors) == 1:
+            mul_result = aligned_factors[0]
+        else:
+            mul_result = _mul(*aligned_factors)
+        if sum_axes_in_output:
+            return _sum(mul_result, *sum_axes_in_output)
+        else:
+            return mul_result
+
+    def apply(self, inputs):
+        return self._rewrite_as_special_case_ops().apply(inputs)
 
     def __repr__(self):
         def letter_for_index(type, num):
@@ -1029,6 +1074,67 @@ def dimshuffle(X, *axes):
     return einsum([(X, indices)], len(axes))
 
 # TODO: tensor_dot, batched_dot
+
+
+# Some special-case ops used internally when generating an
+# implementation expression from an einsum. No argument checking is
+# done for these, since not for public consumption.
+
+class _sum(Expression):
+    def __init__(self, X, *axes):
+        self.axes = axes
+        self.ndim = X.ndim - len(axes)
+        super().__init__([X])
+
+    def _apply_to_parents(self, X):
+        return X.sum(axis=self.axes)
+
+
+class _mul(Expression):
+    def __init__(self, *factors):
+        self.ndim = factors[0].ndim
+        super().__init__(factors)
+
+    def _apply_to_parents(self, *factors):
+        if len(factors) == 1:
+            return factors[0]
+        else:
+            return T.mul(*factors)
+
+
+class _dimshuffle(Expression):
+    def __init__(self, X, *axes):
+        self.axes = axes
+        self.ndim = X.ndim
+        super().__init__([X])
+
+    def _apply_to_parents(self, X):
+        return X.dimshuffle(*self.axes)
+
+
+class _tensordot(Expression):
+    def __init__(self, X, Y, X_axes, Y_axes):
+        self.X_axes = X_axes
+        self.Y_axes = Y_axes
+        self.ndim = X.ndim + Y.ndim - len(X_axes) - len(Y_axes)
+        super().__init__([X, Y])
+
+    def _apply_to_parents(self, X, Y):
+        # TODO maybe call dot directly if only one sum axis
+        return T.tensordot(X, Y, (self.X_axes, self.Y_axes))
+
+
+class _diagonal(Expression):
+    def __init__(self, X, axis1, axis2):
+        self.axis1 = axis1
+        self.axis2 = axis2
+        self.ndim = X.ndim - 1
+        super().__init__([X])
+
+    def _apply_to_parents(self, X):
+        # Bug with T.diagonal when axes are 0, 1 but ndim > 2
+        return T.Diagonal(0, self.axis1, self.axis2)(X)
+
 
 # Elemwise ops
 
