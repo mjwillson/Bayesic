@@ -4,6 +4,10 @@ Probabilistic programming for large datasets via a hybrid of variational inferen
 
 Currently vapourware / early work-in-progress.
 
+UPDATE: currently a bunch of work has gone into a sub-library for symbolic algebra with tensors, which will help automate the algebraic manipulations involved in working with multivariate conjugate exponential families and mean-field updates in conjugate-exponential graphs, amongst other things. It goes beyond what theano offers, rewriting all kinds of multilinear tensor expressions as einsums, and generating efficient implementations for the einsums in terms of dot products etc.
+
+This was admittedly a slight yak-shave, but quite a fun one. I think tensor symbolic algebra is pretty cool and currently noone really does anything more than symbolic differentiation.
+
 ## Motivation
 
 From a machine learning perspective, most probabilistic programming / Bayesian inference libraries I've come across suffer from one or more of these problems:
@@ -108,4 +112,3 @@ Linear transformations of Gaussians are another kind of deterministic that it mi
 [11] Kucukelbir, Alp, Rajesh Ranganath, Andrew Gelman, and David M. Blei. “Automatic Variational Inference in Stan.” arXiv:1506.03431 [stat], June 10, 2015. http://arxiv.org/abs/1506.03431.
 
 [12] Kingma, Diederik P., and Max Welling. “Efficient Gradient-Based Inference through Transformations between Bayes Nets and Neural Nets.” arXiv:1402.0480 [cs, Stat], February 3, 2014. http://arxiv.org/abs/1402.0480.
-
