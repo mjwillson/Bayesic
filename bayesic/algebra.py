@@ -550,7 +550,6 @@ class Einsum(Expression):
         return self \
             ._rewrite_repeated_index_on_factor_as_diagonal() \
             ._rewrite_using_dot_and_sum()
-            #._rewrite_as_sum_of_mul()
 
     def _rewrite_using_dot_and_sum(self):
         """There must be no repeated indices on any factor before calling this
@@ -579,9 +578,9 @@ class Einsum(Expression):
                 n for n, (_, indices) in enumerate(self.factors_and_indices)
                 if index in indices
             ]
-        sum_index = self.sum_indices[-1]
-        factor_nums = factor_nums_occurring_in(self.sum_indices[0])
-        sum_indices = [
+        dot_sum_index = self.sum_indices[0]
+        factor_nums = factor_nums_occurring_in(dot_sum_index)
+        dot_sum_indices = [
             i for i in self.sum_indices if factor_nums_occurring_in(i) == factor_nums
         ]
         if len(factor_nums) == 1:
@@ -589,9 +588,9 @@ class Einsum(Expression):
             # that factor with a version where they're summed over,
             # taking the summation inside the product.
             def replace_with_sum(factor, indices):
-                if sum_index in indices:
-                    sum_axes = [indices.index(i) for i in sum_indices]
-                    new_indices = [i for i in indices if i not in sum_indices]
+                if dot_sum_index in indices:
+                    sum_axes = [indices.index(i) for i in dot_sum_indices]
+                    new_indices = [i for i in indices if i not in dot_sum_indices]
                     return _sum(factor, *sum_axes), new_indices
                 else:
                     return factor, indices
@@ -620,7 +619,7 @@ class Einsum(Expression):
         # until no more decrease is possible.
         lhs = [(factor, indices)
                for factor, indices in self.factors_and_indices
-               if sum_index in indices]
+               if dot_sum_index in indices]
         rhs = [lhs.pop()]
         lhs, rhs = Counter(lhs), Counter(rhs)
 
@@ -641,61 +640,86 @@ class Einsum(Expression):
                 break
             lhs, rhs = new_lhs_rhs
 
-        print("lhs, rhs:", lhs, rhs)
+        # factors in neither lhs nor rhs
+        remaining = [(factor, indices)
+             for factor, indices in self.factors_and_indices
+             if dot_sum_index not in indices]
+        indices_in_remaining = set(i for _, indices in remaining for i in indices)
+
+        lhs, rhs = list(lhs.elements()), list(rhs.elements())
+
         # We now have our lhs and rhs factors for the tensordot. We
         # need to create Einsums for each (which we can recursively
-        # rewrite), with the sum indices we're eliminating mapped
-        # instead to additional output indices, which we put after any
-        # existing ones. (Which is convenient, and for C-contiguous
-        # arrays also means the index we're going to sum over is the
-        # fastest-changing index, which is good). We also need to
-        # renumber the existing out indices (from the parent
-        # expression) since they might not all be used on either lhs
-        # or rhs.
+        # rewrite).
+
+        lhs_indices = set(i for factor, indices in lhs for i in indices)
+        rhs_indices = set(i for factor, indices in rhs for i in indices)
+        both_sides_indices = lhs_indices & rhs_indices
+        # aka batch indices:
+        both_sides_non_dot_indices = sorted(both_sides_indices - set(dot_sum_indices))
+
+
+        # To do this we need to remap all the indices involved in the
+        # lhs and rhs to output or sum indices for the new einsums.
+        # The only sum indices that we can leave are sums that only
+        # touch either lhs or rhs factors, any others (including the
+        # ones we're eliminating via the dot) have to be mapped to
+        # outputs so they can be reused outside.
         def to_einsum_and_outs(factors_and_indices):
-            out_indices = sorted(set(
-                i for _, indices in factors_and_indices
-                for i in indices
-                if i[0] == 'out'
-            ))
-            our_out_to_out = {our_out: ('out', n)
-                              for n, our_out in enumerate(out_indices)}
-            sum_to_out = {s: ('out', len(our_out_to_out) + n)
-                          for n, s in enumerate(sum_indices)}
-            index_mapping = our_out_to_out.copy()
-            index_mapping.update(sum_to_out)
+            indices = set(i for _, indices in factors_and_indices for i in indices)
+
+            # start with any indices (other than the dot sum indices)
+            # that occur on both sides -- these will need to be batch
+            # axes in a batched _tensordot:
+            result_axis_indices = both_sides_non_dot_indices.copy()
+
+            # add any other existing output indices present on this
+            # side, and any sum indices that occur outside this term
+            # too. (Internal-only sum indices don't need to be
+            # outputted).
+            #
+            # if a sum index occurs on the other side we'll already
+            # have it either via both_sides_non_dot_indices or
+            # sum_dot_indices (coming next), so we only look at
+            # indices_in_remaining.
+            non_batch_non_dot_indices = sorted(
+                i for i in indices
+                if (i[0] == 'out' and i not in both_sides_non_dot_indices)
+                or (i[0] == 'sum' and i in indices_in_remaining)
+            )
+            result_axis_indices += non_batch_non_dot_indices
+
+            # Finally the indices we're dotting over.
+            result_axis_indices += dot_sum_indices
+
+            indices_to_result_out = {
+                i: ('out', n) for n, i in enumerate(result_axis_indices)}
 
             einsum = Einsum([
-                (factor, tuple(index_mapping.get(i, i) for i in indices))
+                (factor, tuple(indices_to_result_out.get(i, i) for i in indices))
                 for factor, indices in factors_and_indices
-            ], len(out_indices) + len(sum_indices))
-            print(einsum, einsum.ndim, einsum.factors_and_indices, factors_and_indices)
-            sum_axes = [sum_to_out[s][1] for s in sum_indices]
-            return einsum, sum_axes, out_indices
+            ], len(result_axis_indices))._rewrite_using_dot_and_sum()
+            sum_axes = [indices_to_result_out[s][1] for s in dot_sum_indices]
+            return einsum, sum_axes, non_batch_non_dot_indices
 
-        lhs_einsum, lhs_sum_axes, lhs_nonsum_out = to_einsum_and_outs(list(lhs.elements()))
-        rhs_einsum, rhs_sum_axes, rhs_nonsum_out = to_einsum_and_outs(list(rhs.elements()))
-        print("lhs_einsum, lhs_sum_axes, lhs_nonsum_out", lhs_einsum, lhs_sum_axes, lhs_nonsum_out)
-        print("rhs_einsum, rhs_sum_axes, rhs_nonsum_out", rhs_einsum, rhs_sum_axes, rhs_nonsum_out)
-        tensordot_result = _tensordot(
-            lhs_einsum._rewrite_using_dot_and_sum(),
-            rhs_einsum._rewrite_using_dot_and_sum(),
-            lhs_sum_axes,
-            rhs_sum_axes
+        lhs_einsum, lhs_sum_axes, lhs_non_batch_non_dot_indices = to_einsum_and_outs(lhs)
+        rhs_einsum, rhs_sum_axes, rhs_non_batch_non_dot_indices = to_einsum_and_outs(rhs)
+        batch_axes = list(range(len(both_sides_non_dot_indices)))
+        dot_result = _tensordot(
+            lhs_einsum, rhs_einsum,
+            lhs_sum_axes, rhs_sum_axes, batch_axes, batch_axes
         )
-        # tensordot output has shape (lhs without sum indices) + (rhs
-        # without sum indices). We put the sum indices as the last
-        # ones on lhs and rhs so:
-        tensordot_indices = lhs_nonsum_out + rhs_nonsum_out
+
+        # tensordot output has shape
+        # batch_shape + lhs_remaining_shape + rhs_remaining_shape
+        # where remaining excludes the batch axes and dot sum axes.
+        dot_indices = tuple(
+            both_sides_non_dot_indices + lhs_non_batch_non_dot_indices +
+            rhs_non_batch_non_dot_indices)
         # Now combine with any remaining factors not containing the
         # sum indices at all
-        print(tensordot_result, tensordot_indices)
-        remaining = [(factor, indices)
-                     for factor, indices in self.factors_and_indices
-                     if sum_index not in indices]
-        return Einsum(remaining + [(tensordot_result, tensordot_indices)], self.ndim) \
+        return Einsum(remaining + [(dot_result, dot_indices)], self.ndim) \
             ._rewrite_using_dot_and_sum()
-
 
     def _rewrite_as_mul_of_dimshuffles(self):
         """This requires no repeated indices on a factor, and no sum indices."""
@@ -722,52 +746,6 @@ class Einsum(Expression):
             return aligned_factors[0]
         else:
             return _mul(*aligned_factors)
-
-    def _rewrite_as_sum_of_mul(self):
-        """A naive approach to implementing an einsum: dimshuffle all tensors
-        so they line up, with one axis per (sum or output) index and
-        so that they broadcast over any indices that don't appear.
-        Then just multiply them, and then sum over the sum axes.
-
-        This can be very slow, since it creates a big (potentially
-        high-dimensional) intermediate result tensor.
-
-        There must be no repeated indices on any factor before calling
-        this (see _rewrite_repeated_index_on_factor_as_diagonal)
-
-        TODO: we can do better than this by spotting sums that are
-        reducible to matrix-matrix, matrix-vector products. For now
-        just worrying about the algebra though.
-
-        """
-        def axis_of(index, indices):
-            try:
-                return indices.index(index)
-            except ValueError:
-                return 'x'
-
-        def dimshuffle_to_axes(factor, indices):
-            axes = [axis_of(i, indices) for i in self.out_indices + self.sum_indices]
-            if axes == list(range(factor.ndim)):
-                return factor
-            else:
-                return _dimshuffle(factor, *axes)
-
-        aligned_factors = [
-            dimshuffle_to_axes(factor, indices)
-            for factor, indices in self.factors_and_indices
-        ]
-        sum_axes_in_output = list(range(self.ndim, self.ndim + len(self.sum_indices)))
-        if len(aligned_factors) == 0:
-            mul_result = dimshuffle(constant(1), *(['x'] * self.ndim))
-        elif len(aligned_factors) == 1:
-            mul_result = aligned_factors[0]
-        else:
-            mul_result = _mul(*aligned_factors)
-        if sum_axes_in_output:
-            return _sum(mul_result, *sum_axes_in_output)
-        else:
-            return mul_result
 
     def apply(self, inputs):
         return self._rewrite_as_special_case_ops().apply(inputs)
@@ -1277,24 +1255,74 @@ class _mul(Expression):
 class _dimshuffle(Expression):
     def __init__(self, X, *axes):
         self.axes = axes
-        self.ndim = X.ndim
+        self.ndim = len(axes)
         super().__init__([X])
 
     def _apply_to_parents(self, X):
         return X.dimshuffle(*self.axes)
 
+    def __repr__(self):
+        return "%s(%s, %s)" % (type(self).__name__, repr(self.parents[0]), ', '.join(repr(a) for a in self.axes))
+
 
 class _tensordot(Expression):
-    def __init__(self, X, Y, X_axes, Y_axes):
-        self.X_axes = X_axes
-        self.Y_axes = Y_axes
-        self.ndim = X.ndim + Y.ndim - len(X_axes) - len(Y_axes)
+    """This generalises theano's `tensordot` and `batched_tensordot`
+
+    X_batch_axes and Y_batch_axes must be same length and not include
+    any of the respective dot axes.
+
+    Output shape is batch_shape + X_remaining_shape + Y_remaining_shape
+
+    """
+    def __init__(self, X, Y, X_dot_axes, Y_dot_axes, X_batch_axes=[], Y_batch_axes=[]):
+        self.X_dot_axes = X_dot_axes
+        self.Y_dot_axes = Y_dot_axes
+        self.X_batch_axes = X_batch_axes
+        self.Y_batch_axes = Y_batch_axes
+        self.X_other_axes = [
+            n for n in range(X.ndim) if n not in X_dot_axes and n not in X_batch_axes]
+        self.Y_other_axes = [
+            n for n in range(Y.ndim) if n not in Y_dot_axes and n not in Y_batch_axes]
+        self.ndim = X.ndim + Y.ndim - len(X_dot_axes) - len(Y_dot_axes) - len(Y_batch_axes)
         super().__init__([X, Y])
 
     def _apply_to_parents(self, X, Y):
-        # TODO maybe call dot directly if only one sum axis
-        print("_tensordot", X, Y, self.X_axes, self.Y_axes)
-        return T.tensordot(X, Y, (self.X_axes, self.Y_axes))
+        if not self.X_batch_axes:
+            # No batching, plain tensordot.
+            # TODO maybe call dot directly if only one sum axis
+            return T.tensordot(X, Y, (self.X_dot_axes, self.Y_dot_axes))
+        else:
+            num_dot_and_batch = len(self.X_dot_axes) + len(self.X_batch_axes)
+            if self.X_other_axes and self.Y_other_axes:
+                # This can be written as a batched matrix-matrix dot,
+                # which theano's batched_dot is probably worth using
+                # for.
+                batch_size = T.prod(X.shape[n] for n in self.X_batch_axes)
+                other_size = T.prod(X.shape[n] for n in self.X_other_axes)
+                dot_size = T.prod(X.shape[n] for n in self.X_dot_axes)
+                X_arg = X.dimshuffle(self.X_batch_axes + self.X_other_axes + self.X_dot_axes) \
+                         .reshape([batch_size, other_size, dot_size])
+
+                batch_size = T.prod(Y.shape[n] for n in self.Y_batch_axes)
+                other_size = T.prod(Y.shape[n] for n in self.Y_other_axes)
+                dot_size = T.prod(Y.shape[n] for n in self.Y_dot_axes)
+                Y_arg = Y.dimshuffle(self.Y_batch_axes + self.Y_other_axes + self.Y_dot_axes) \
+                         .reshape([batch_size, other_size, dot_size])
+
+                result = T.batched_dot(X_arg, Y_arg) \
+                         .reshape([X.shape[n] for n in self.X_batch_axes] +
+                                  [X.shape[n] for n in self.X_other_axes] +
+                                  [Y.shape[n] for n in self.Y_other_axes])
+            else:
+                # Theano's batched_dot probably not worth using for a
+                # batched matrix-vector or vector-vector dot (see
+                # their docs) -- we just implement via mul and sum.
+                X_arg = X.dimshuffle(self.X_batch_axes + self.X_other_axes +
+                                     ['x' for _ in self.Y_other_axes] + self.X_dot_axes)
+                Y_arg = X.dimshuffle(self.Y_batch_axes + ['x' for _ in self.X_other_axes] +
+                                     self.Y_other_axes + self.Y_dot_axes)
+                sum_axes = [-1-n for n in range(len(self.X_dot_axes))]
+                return (X_arg * Y_arg).sum(axis=sum_axes)
 
 
 class _diagonal(Expression):
