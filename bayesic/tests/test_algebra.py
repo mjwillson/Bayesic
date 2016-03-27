@@ -1,4 +1,7 @@
 from ..algebra import *
+# We use these internals to check that under-the-hood einsum rewriting
+# is happening in an expected and efficient way:
+from ..algebra import _sum, _mul, _dimshuffle, _tensordot, _diagonal
 
 import numpy.testing as npt
 import numpy as np
@@ -20,6 +23,7 @@ def randn(*shape):
 X = var('X', 2)
 Y = var('Y', 2)
 Z = var('Z', 2)
+W = var('W', 2)
 X_ = randn(5, 5)
 Y_ = randn(5, 5)
 
@@ -307,17 +311,8 @@ def test_equality_of_expressions():
 
 
 def test_match():
-    # slightly circular as match is used in einsum.__eq__
-
-    # eye insertion to achieve match:
-    assert match(X * Y, dot(X*Y, Z), Z) == eye(X.shape[1])
-    assert match(X, dot(X, Z), Z) == eye(X.shape[1])
-
-    assert match(X * y.dimshuffle('x', 0), dot(X, Z), Z) \
-        == eye(X.shape[1]) * y.dimshuffle(0, 'x')
-    # TODO: it doesn't know that
-    # eye() * x.dimshuffle(0, 'x') == eye() * x.dimshuffle('x', 0)
-    # (both == diag(x))
+    # slightly circular as match is used in einsum.__eq__,
+    # but still useful to test
 
     assert match(X * Y, X * Z, Z) == Y
     assert match(X * X, X * Z, Z) == X
@@ -349,36 +344,162 @@ def test_match():
 
 def test_identity_elimination():
     assert dot(X, eye(X.shape[1])) == X
+    assert dot(eye(X.shape[0]), X) == X
+    assert dot(Y, dot(eye(X.shape[0]), X)) == dot(Y, X)
 
 
-def theano_eq(A, B):
-    """Recursively compare two theano expressions. This is probably not
-    foolproof, but good enough for these tests
+def test_identity_insertion_to_achieve_match():
+    assert match(X * Y, dot(X*Y, Z), Z) == eye(X.shape[1])
+    assert match(X, dot(X, Z), Z) == eye(X.shape[1])
+    assert match(X * y.dimshuffle('x', 0), dot(X, Z), Z) \
+        == eye(X.shape[1]) * y.dimshuffle(0, 'x')
+    # TODO: it doesn't know that
+    # eye() * x.dimshuffle(0, 'x') == eye() * x.dimshuffle('x', 0)
+    # (both == diag(x))
 
-    """
-    if A.owner is not None:
-        return (
-            B.owner is not None and
-            A.index == B.index and
-            A.owner.op == B.owner.op and
-            all(theano_eq(X, Y) for X, Y in zip(A.owner.inputs, B.owner.inputs))
+
+def assert_implemented_as(expr, impl_expr):
+    rewritten = expr._rewrite_as_special_case_ops()
+    assert rewritten == impl_expr, "%r != %r" % (rewritten, impl_expr)
+
+
+# Warning: these einsum-rewriting tests are slightly too specific in
+# what they test for -- in practise there are a few equivalent outputs
+# that could be acceptable, usually differing only by presence of
+# extra dimshuffles, flipping lhs / rhs of a tensordot etc (so e.g.
+# based on identities like XY = (Y^T X^T)^T). That said we do have
+# some logic that tries to make pretty / conventional choices in these
+# cases that preserve the original expression order when it's not too
+# hard to do this, so perhaps fair to test for this.
+
+
+def test_basic_einsum_rewriting():
+    assert_implemented_as(
+        diagonal(X),
+        _diagonal(X, 0, 1)
+    )
+    assert_implemented_as(
+        dot(X, Y),
+        _tensordot(X, Y, [1], [0])
+    )
+    assert_implemented_as(
+        sum(X, 1),
+        _sum(X, 1)
+    )
+    assert_implemented_as(
+        mul(X, Y),
+        _mul(X, Y)
+    )
+    assert_implemented_as(
+        dimshuffle(X, 1, 0),
+        _dimshuffle(X, 1, 0)
+    )
+
+
+def test_einsum_rewriting_can_generate_nested_tensordots_preserving_specified_dot_bracketing():
+    assert_implemented_as(
+        dot(X, dot(Y, Z)),
+        _tensordot(X, _tensordot(Y, Z, [1], [0]), [1], [0])
+    )
+    assert_implemented_as(
+        dot(dot(X, Y), Z),
+        _tensordot(_tensordot(X, Y, [1], [0]), Z, [1], [0])
+    )
+    assert_implemented_as(
+        dot(dot(X, Y), dot(Z, W)),
+        _tensordot(_tensordot(X, Y, [1], [0]),
+                   _tensordot(Z, W, [1], [0]),
+                   [1], [0])
+    )
+    assert_implemented_as(
+        dot(dot(X, dot(Y, Z)), W),
+        _tensordot(
+            _tensordot(
+                X,
+                _tensordot(Y, Z, [1], [0]),
+                [1], [0]
+            ),
+            W,
+            [1], [0]
         )
-    else:
-        # constant, variable, ...?
-        return A == B
+    )
 
-def assert_theano_eq(A, B):
-    assert theano_eq(A, B), "theano expressions don't match:\n\n%s\n\n%s" \
-        % (Tprint(A, file='str'), Tprint(B, file='str'))
-
-
-def test_einsum_impl():
-    tin, texpr = (X*Y).sum(axis=1)._theano_inputs_and_expression()
-    assert_theano_eq((tin['X'] * tin['Y']).sum(axis=1), texpr)
-
-    tin, texpr = X.sum(axis=1)._theano_inputs_and_expression()
-    assert_theano_eq(tin['X'].sum(axis=1), texpr)
+    # Just a reminder that we know these are algebraically equivalent
+    # -- still in practise the order we do them in can matter for
+    # compute cost, so we don't want to throw that information away
+    # when doing this fancy everything-goes-via-einsums stuff. The
+    # information is kept in the ordering of the sum indices.
+    assert dot(X, dot(Y, Z)) == dot(dot(X, Y), Z)
+    assert dot(dot(X, Y), dot(Z, W)) == dot(dot(X, dot(Y, Z)), W)
 
 
-    tin, texpr = dot(X, Y)._theano_inputs_and_expression()
-    assert_theano_eq(T.dot(tin['X'], tin['Y']), texpr)
+def test_einsum_rewriting_no_summation():
+    assert_implemented_as(
+        X * Y.T * x.dimshuffle(0, 'x'),
+        _mul(X, _dimshuffle(Y, 1, 0), _dimshuffle(x, 0, 'x'))
+    )
+
+
+def test_einsum_rewriting_summation_affecting_one_term_only():
+    # can't generate a dot product in these cases
+    assert_implemented_as(
+        X.sum(1) * y,
+        _mul(_sum(X, 1), y)
+    )
+
+
+def test_einsum_rewriting_as_tensordot():
+    # hadamard product of matrices, implemented as a tensor dot
+    # product:
+    assert_implemented_as(
+        trace(dot(X.T, Y)),
+        _tensordot(X, Y, [0, 1], [0, 1])
+    )
+
+    # mul and row-wise sum as a batched vector-vector dot product:
+    assert_implemented_as(
+        (X * Y.T).sum(axis=1),
+        _tensordot(
+            X, Y,
+            X_dot_axes=[1], Y_dot_axes=[0],
+            X_batch_axes=[0], Y_batch_axes=[1]
+        )
+    )
+
+
+def test_einsum_rewriting_is_smart_about_grouping_terms_into_lhs_and_rhs_when_generating_a_tensordot():
+    # this could be implemented a few ways:
+    # dot(Z, x*y), dot(Z*x, y), dot(Z*y, x)
+    # the first is best as it requires the least broadcasting.
+    assert_implemented_as(
+        dot(Z, x * y),
+        _tensordot(Z, _mul(x, y), [1], [0])
+    )
+    assert_implemented_as(
+        dot(Z*x.dimshuffle('x', 0), y),
+        _tensordot(Z, _mul(x, y), [1], [0])
+    )
+    assert_implemented_as(
+        dot(Z*y.dimshuffle('x', 0), x),
+        _tensordot(Z, _mul(x, y), [1], [0])
+    )
+
+    # These two expressions are equivalent. The former is better (just
+    # a mx-mx dot product and two matrix elemwise muls, vs going via
+    # 3d tensors and doing a bunch of broadcasting). The rewriting
+    # process should choose it in both cases when it decides how to
+    # split factors between the lhs and the rhs of the _tensordot it
+    # generates.
+    assert_implemented_as(
+        dot(X*Y, Z*W),
+        _tensordot(_mul(X, Y), _mul(Z, W), [1], [0])
+    )
+    assert_implemented_as(
+        tensordot(
+            X.dimshuffle(0,1,'x') * Z.dimshuffle('x',0,1),
+            Y.dimshuffle(0,1,'x') * W.dimshuffle('x',0,1),
+            X_sum_axes=[1], Y_sum_axes=[1],
+            X_batch_axes=[0, 2], Y_batch_axes=[0, 2]
+        ),
+        _tensordot(_mul(X, Y), _mul(Z, W), [1], [0])
+    )
